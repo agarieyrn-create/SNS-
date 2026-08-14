@@ -14,6 +14,7 @@ vi.mock("../db", () => ({
   createDrafts: vi.fn(),
   listResults: vi.fn(),
   createResult: vi.fn(),
+  importResults: vi.fn(),
   updateResult: vi.fn(),
   deleteResult: vi.fn(),
   getDashboard: vi.fn(),
@@ -64,7 +65,7 @@ describe("growth router", () => {
   });
 
   it("returns all user-scoped data for export", async () => {
-    const payload = { exportedAt: new Date().toISOString(), ideas: [], drafts: [], results: [], settings };
+    const payload = { exportedAt: new Date().toISOString(), ideas: [], drafts: [], results: [], weeklyReports: [], settings };
     vi.mocked(db.getExportData).mockResolvedValue(payload);
     await expect(caller.exportData()).resolves.toEqual(payload);
     expect(db.getExportData).toHaveBeenCalledWith(user.id);
@@ -105,6 +106,13 @@ describe("growth router", () => {
     vi.mocked(db.deleteResult).mockResolvedValue({ success: true });
     await expect(caller.results.delete({ id: 9 })).resolves.toEqual({ success: true });
     expect(db.deleteResult).toHaveBeenCalledWith(user.id, 9);
+  });
+
+  it("imports validated performance rows into the signed-in workspace", async () => {
+    const row = { ideaId: null, draftId: null, title: "CSVからの投稿", category: "AI × 業務効率化", postUrl: null, postedAt: new Date("2026-08-14T10:00:00.000Z"), impressions: 900, engagements: 34, likes: 20, replies: 4, reposts: 3, bookmarks: 5, clicks: 2, notes: "インポート" };
+    vi.mocked(db.importResults).mockResolvedValue({ imported: 1 });
+    await expect(caller.results.import({ rows: [row] })).resolves.toEqual({ imported: 1 });
+    expect(db.importResults).toHaveBeenCalledWith(user.id, [row]);
   });
 
   it("returns the aggregated dashboard exactly for the signed-in workspace", async () => {

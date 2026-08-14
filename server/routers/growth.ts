@@ -35,6 +35,11 @@ const resultInput = z.object({
   notes: z.string().max(4000).nullable().optional(),
 });
 
+const importedResultInput = resultInput.extend({
+  ideaId: z.null().optional().default(null),
+  draftId: z.null().optional().default(null),
+});
+
 export const growthRouter = router({
   dashboard: protectedProcedure.query(({ ctx }) => db.getDashboard(ctx.user.id)),
   models: protectedProcedure.query(async () => {
@@ -124,6 +129,7 @@ export const growthRouter = router({
       return db.updateResult(ctx.user.id, id, updates);
     }),
     delete: protectedProcedure.input(z.object({ id: z.number().int().positive() })).mutation(({ ctx, input }) => db.deleteResult(ctx.user.id, input.id)),
+    import: protectedProcedure.input(z.object({ rows: z.array(importedResultInput).min(1).max(500) })).mutation(({ ctx, input }) => db.importResults(ctx.user.id, input.rows)),
   }),
   settings: router({
     get: protectedProcedure.query(({ ctx }) => db.getGrowthSettings(ctx.user.id)),

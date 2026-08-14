@@ -102,6 +102,10 @@ export async function deleteIdea(userId: number, id: number) {
   const scopedWhere = and(eq(ideas.id, id), eq(ideas.userId, userId));
   const rows = await db.select().from(ideas).where(scopedWhere).limit(1);
   if (!rows[0]) throw new Error("Idea not found");
+  // Preserve the user's existing drafts and performance history after the
+  // originating idea is removed.
+  await db.update(postDrafts).set({ ideaId: null }).where(and(eq(postDrafts.userId, userId), eq(postDrafts.ideaId, id)));
+  await db.update(postResults).set({ ideaId: null }).where(and(eq(postResults.userId, userId), eq(postResults.ideaId, id)));
   await db.delete(ideas).where(scopedWhere);
   return { success: true } as const;
 }
@@ -155,9 +159,25 @@ export async function listResults(userId: number) {
 export async function createResult(userId: number, input: Omit<typeof postResults.$inferInsert, "id" | "userId" | "createdAt" | "updatedAt">) {
   const db = await getDb();
   if (!db) throw new Error("Database is not available");
+  if (input.ideaId) {
+    const idea = await db.select({ id: ideas.id }).from(ideas).where(and(eq(ideas.id, input.ideaId), eq(ideas.userId, userId))).limit(1);
+    if (!idea[0]) throw new Error("Related idea not found");
+  }
+  if (input.draftId) {
+    const draft = await db.select({ id: postDrafts.id }).from(postDrafts).where(and(eq(postDrafts.id, input.draftId), eq(postDrafts.userId, userId))).limit(1);
+    if (!draft[0]) throw new Error("Related draft not found");
+  }
   const [created] = await db.insert(postResults).values({ ...input, userId }).$returningId();
   const rows = await db.select().from(postResults).where(eq(postResults.id, created.id)).limit(1);
   return rows[0];
+}
+
+export async function importResults(userId: number, inputs: Array<Omit<typeof postResults.$inferInsert, "id" | "userId" | "createdAt" | "updatedAt">>) {
+  const db = await getDb();
+  if (!db) throw new Error("Database is not available");
+  if (!inputs.length) return { imported: 0 } as const;
+  await db.insert(postResults).values(inputs.map(input => ({ ...input, userId })));
+  return { imported: inputs.length } as const;
 }
 
 export async function updateResult(userId: number, id: number, input: Partial<Omit<typeof postResults.$inferInsert, "id" | "userId" | "createdAt" | "updatedAt">>) {
@@ -214,8 +234,8 @@ export async function getDashboard(userId: number) {
 }
 
 export async function getExportData(userId: number) {
-  const [ideaRows, resultRows, draftRows, settings] = await Promise.all([listIdeas(userId), listResults(userId), listDrafts(userId), getGrowthSettings(userId)]);
-  return { exportedAt: new Date().toISOString(), ideas: ideaRows, results: resultRows, drafts: draftRows, settings };
+  const [ideaRows, resultRows, draftRows, reportRows, settings] = await Promise.all([listIdeas(userId), listResults(userId), listDrafts(userId), listWeeklyReports(userId), getGrowthSettings(userId)]);
+  return { exportedAt: new Date().toISOString(), ideas: ideaRows, results: resultRows, drafts: draftRows, weeklyReports: reportRows, settings };
 }
 
 export async function listResultsInRange(userId: number, start: Date, end: Date) {
