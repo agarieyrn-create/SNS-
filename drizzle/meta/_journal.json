@@ -15,6 +15,13 @@
       "when": 1786715099678,
       "tag": "0001_perpetual_squirrel_girl",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "5",
+      "when": 1786716464921,
+      "tag": "0002_blue_electro",
+      "breakpoints": true
     }
   ]
 }

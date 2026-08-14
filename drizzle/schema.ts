@@ -1,4 +1,4 @@
-import { datetime, index, int, json, mysqlEnum, mysqlTable, text, timestamp, uniqueIndex, varchar } from "drizzle-orm/mysql-core";
+import { boolean, datetime, index, int, json, mysqlEnum, mysqlTable, text, timestamp, uniqueIndex, varchar } from "drizzle-orm/mysql-core";
 
 export const users = mysqlTable("users", {
   id: int("id").autoincrement().primaryKey(),
@@ -75,9 +75,30 @@ export const growthSettings = mysqlTable("growthSettings", {
   bannedWords: json("bannedWords").$type<string[]>().notNull(),
   analysisRules: text("analysisRules"),
   defaultTone: varchar("defaultTone", { length: 80 }).default("知的で親しみやすい").notNull(),
+  weeklyReportEnabled: boolean("weeklyReportEnabled").default(true).notNull(),
+  weeklyReportCronTaskUid: varchar("weeklyReportCronTaskUid", { length: 65 }),
+  weeklyReportLastGeneratedAt: datetime("weeklyReportLastGeneratedAt"),
   createdAt: timestamp("createdAt").defaultNow().notNull(),
   updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
-}, table => [uniqueIndex("growth_settings_user_unique").on(table.userId)]);
+}, table => [uniqueIndex("growth_settings_user_unique").on(table.userId), index("growth_settings_weekly_cron_idx").on(table.weeklyReportCronTaskUid)]);
+
+export const weeklyReports = mysqlTable("weeklyReports", {
+  id: int("id").autoincrement().primaryKey(),
+  userId: int("userId").notNull(),
+  weekStart: datetime("weekStart").notNull(),
+  weekEnd: datetime("weekEnd").notNull(),
+  source: mysqlEnum("source", ["manual", "scheduled"]).notNull(),
+  postCount: int("postCount").notNull(),
+  impressions: int("impressions").notNull(),
+  engagements: int("engagements").notNull(),
+  engagementRateBps: int("engagementRateBps").notNull(),
+  impressionChangePct: int("impressionChangePct"),
+  engagementRateChangeBps: int("engagementRateChangeBps"),
+  categoryBreakdown: json("categoryBreakdown").$type<Array<{ category: string; posts: number; impressions: number; engagements: number; engagementRate: number }>>().notNull(),
+  insights: json("insights").$type<{ headline: string; summary: string; wins: string[]; risks: string[]; actions: string[] }>().notNull(),
+  createdAt: timestamp("createdAt").defaultNow().notNull(),
+  updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
+}, table => [uniqueIndex("weekly_reports_user_week_unique").on(table.userId, table.weekStart), index("weekly_reports_user_created_idx").on(table.userId, table.createdAt)]);
 
 export type User = typeof users.$inferSelect;
 export type InsertUser = typeof users.$inferInsert;
@@ -85,3 +106,4 @@ export type Idea = typeof ideas.$inferSelect;
 export type PostDraft = typeof postDrafts.$inferSelect;
 export type PostResult = typeof postResults.$inferSelect;
 export type GrowthSettings = typeof growthSettings.$inferSelect;
+export type WeeklyReport = typeof weeklyReports.$inferSelect;

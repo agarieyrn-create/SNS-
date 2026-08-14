@@ -1,6 +1,6 @@
-import { and, desc, eq } from "drizzle-orm";
+import { and, desc, eq, gte, lt } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/mysql2";
-import { GrowthSettings, growthSettings, ideas, InsertUser, postDrafts, postResults, users } from "../drizzle/schema";
+import { GrowthSettings, growthSettings, ideas, InsertUser, postDrafts, postResults, users, weeklyReports } from "../drizzle/schema";
 import { calculateEngagementRate, makeTrend, reviewPost } from "./growth-utils";
 import { ENV } from "./_core/env";
 
@@ -216,4 +216,47 @@ export async function getDashboard(userId: number) {
 export async function getExportData(userId: number) {
   const [ideaRows, resultRows, draftRows, settings] = await Promise.all([listIdeas(userId), listResults(userId), listDrafts(userId), getGrowthSettings(userId)]);
   return { exportedAt: new Date().toISOString(), ideas: ideaRows, results: resultRows, drafts: draftRows, settings };
+}
+
+export async function listResultsInRange(userId: number, start: Date, end: Date) {
+  const db = await getDb();
+  if (!db) throw new Error("Database is not available");
+  return db.select().from(postResults).where(and(eq(postResults.userId, userId), gte(postResults.postedAt, start), lt(postResults.postedAt, end))).orderBy(desc(postResults.postedAt));
+}
+
+export async function getWeeklyReportByWeek(userId: number, weekStart: Date) {
+  const db = await getDb();
+  if (!db) throw new Error("Database is not available");
+  const rows = await db.select().from(weeklyReports).where(and(eq(weeklyReports.userId, userId), eq(weeklyReports.weekStart, weekStart))).limit(1);
+  return rows[0];
+}
+
+export async function listWeeklyReports(userId: number) {
+  const db = await getDb();
+  if (!db) throw new Error("Database is not available");
+  return db.select().from(weeklyReports).where(eq(weeklyReports.userId, userId)).orderBy(desc(weeklyReports.weekStart));
+}
+
+export async function saveWeeklyReport(userId: number, input: Omit<typeof weeklyReports.$inferInsert, "id" | "userId" | "createdAt" | "updatedAt">) {
+  const db = await getDb();
+  if (!db) throw new Error("Database is not available");
+  await db.insert(weeklyReports).values({ userId, ...input }).onDuplicateKeyUpdate({ set: input });
+  const report = await getWeeklyReportByWeek(userId, input.weekStart);
+  if (!report) throw new Error("Could not save weekly report");
+  return report;
+}
+
+export async function updateWeeklyReportSchedule(userId: number, updates: Partial<Pick<typeof growthSettings.$inferInsert, "weeklyReportEnabled" | "weeklyReportCronTaskUid" | "weeklyReportLastGeneratedAt">>) {
+  const db = await getDb();
+  if (!db) throw new Error("Database is not available");
+  await getGrowthSettings(userId);
+  await db.update(growthSettings).set(updates).where(eq(growthSettings.userId, userId));
+  return getGrowthSettings(userId);
+}
+
+export async function getGrowthSettingsByWeeklyCronTaskUid(taskUid: string) {
+  const db = await getDb();
+  if (!db) throw new Error("Database is not available");
+  const rows = await db.select().from(growthSettings).where(eq(growthSettings.weeklyReportCronTaskUid, taskUid)).limit(1);
+  return rows[0];
 }
