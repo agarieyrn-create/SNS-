@@ -1,6 +1,6 @@
 import { and, desc, eq, gte, lt } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/mysql2";
-import { GrowthSettings, growthSettings, ideas, InsertUser, postDrafts, postResults, users, weeklyReports } from "../drizzle/schema";
+import { GrowthSettings, growthSettings, ideas, InsertUser, postDrafts, postResults, users, weeklyReportRuns, weeklyReports } from "../drizzle/schema";
 import { calculateEngagementRate, makeTrend, reviewPost } from "./growth-utils";
 import { ENV } from "./_core/env";
 
@@ -120,6 +120,10 @@ export async function createDrafts(userId: number, ideaId: number | null, tone: 
   const db = await getDb();
   if (!db) throw new Error("Database is not available");
   if (!contents.length) return [];
+  if (ideaId) {
+    const idea = await db.select({ id: ideas.id }).from(ideas).where(and(eq(ideas.id, ideaId), eq(ideas.userId, userId))).limit(1);
+    if (!idea[0]) throw new Error("Related idea not found");
+  }
   const values = contents.map(content => {
     const review = reviewPost(content, charLimit, bannedWords);
     return { userId, ideaId, tone, charLimit, content, ...review };
@@ -146,6 +150,7 @@ export async function deleteDraft(userId: number, id: number) {
   const scopedWhere = and(eq(postDrafts.id, id), eq(postDrafts.userId, userId));
   const existing = await db.select().from(postDrafts).where(scopedWhere).limit(1);
   if (!existing[0]) throw new Error("Draft not found");
+  // The database foreign key clears postResults.draftId while preserving performance history.
   await db.delete(postDrafts).where(scopedWhere);
   return { success: true } as const;
 }
@@ -175,9 +180,34 @@ export async function createResult(userId: number, input: Omit<typeof postResult
 export async function importResults(userId: number, inputs: Array<Omit<typeof postResults.$inferInsert, "id" | "userId" | "createdAt" | "updatedAt">>) {
   const db = await getDb();
   if (!db) throw new Error("Database is not available");
-  if (!inputs.length) return { imported: 0 } as const;
-  await db.insert(postResults).values(inputs.map(input => ({ ...input, userId })));
-  return { imported: inputs.length } as const;
+  if (!inputs.length) return { imported: 0, duplicates: 0, duplicateRows: [] as number[] } as const;
+  const existing = await db.select({ title: postResults.title, postUrl: postResults.postUrl, postedAt: postResults.postedAt }).from(postResults).where(eq(postResults.userId, userId));
+  const toKey = (row: { title: string; postUrl?: string | null; postedAt: Date }) => row.postUrl ? `url:${row.postUrl.trim().toLowerCase()}` : `fallback:${row.title.trim().toLowerCase()}|${new Date(row.postedAt).toISOString()}`;
+  const known = new Set(existing.map(toKey));
+  const duplicateRows: number[] = [];
+  const importable = inputs.filter((input, index) => {
+    const key = toKey({ title: input.title, postUrl: input.postUrl, postedAt: input.postedAt });
+    if (known.has(key)) { duplicateRows.push(index + 2); return false; }
+    known.add(key);
+    return true;
+  });
+  if (importable.length) await db.insert(postResults).values(importable.map(input => ({ ...input, userId })));
+  return { imported: importable.length, duplicates: duplicateRows.length, duplicateRows };
+}
+
+export async function previewResultImport(userId: number, inputs: Array<Omit<typeof postResults.$inferInsert, "id" | "userId" | "createdAt" | "updatedAt">>) {
+  const db = await getDb();
+  if (!db) throw new Error("Database is not available");
+  const existing = await db.select({ title: postResults.title, postUrl: postResults.postUrl, postedAt: postResults.postedAt }).from(postResults).where(eq(postResults.userId, userId));
+  const toKey = (row: { title: string; postUrl?: string | null; postedAt: Date }) => row.postUrl ? `url:${row.postUrl.trim().toLowerCase()}` : `fallback:${row.title.trim().toLowerCase()}|${new Date(row.postedAt).toISOString()}`;
+  const known = new Set(existing.map(toKey));
+  const duplicateRows: number[] = [];
+  inputs.forEach((input, index) => {
+    const key = toKey({ title: input.title, postUrl: input.postUrl, postedAt: input.postedAt });
+    if (known.has(key)) duplicateRows.push(index + 2);
+    else known.add(key);
+  });
+  return { accepted: inputs.length - duplicateRows.length, duplicateRows };
 }
 
 export async function updateResult(userId: number, id: number, input: Partial<Omit<typeof postResults.$inferInsert, "id" | "userId" | "createdAt" | "updatedAt">>) {
@@ -186,6 +216,14 @@ export async function updateResult(userId: number, id: number, input: Partial<Om
   const scopedWhere = and(eq(postResults.id, id), eq(postResults.userId, userId));
   const existing = await db.select().from(postResults).where(scopedWhere).limit(1);
   if (!existing[0]) throw new Error("Result not found");
+  if (input.ideaId !== undefined && input.ideaId !== null) {
+    const idea = await db.select({ id: ideas.id }).from(ideas).where(and(eq(ideas.id, input.ideaId), eq(ideas.userId, userId))).limit(1);
+    if (!idea[0]) throw new Error("Related idea not found");
+  }
+  if (input.draftId !== undefined && input.draftId !== null) {
+    const draft = await db.select({ id: postDrafts.id }).from(postDrafts).where(and(eq(postDrafts.id, input.draftId), eq(postDrafts.userId, userId))).limit(1);
+    if (!draft[0]) throw new Error("Related draft not found");
+  }
   await db.update(postResults).set(input).where(scopedWhere);
   const rows = await db.select().from(postResults).where(scopedWhere).limit(1);
   return rows[0];
@@ -255,6 +293,26 @@ export async function listWeeklyReports(userId: number) {
   const db = await getDb();
   if (!db) throw new Error("Database is not available");
   return db.select().from(weeklyReports).where(eq(weeklyReports.userId, userId)).orderBy(desc(weeklyReports.weekStart));
+}
+
+export async function createWeeklyReportRun(userId: number, input: { taskUid?: string | null; trigger: "manual" | "scheduled" | "retry" }) {
+  const db = await getDb();
+  if (!db) throw new Error("Database is not available");
+  const startedAt = new Date();
+  const [created] = await db.insert(weeklyReportRuns).values({ userId, taskUid: input.taskUid ?? null, trigger: input.trigger, status: "running", startedAt }).$returningId();
+  return { id: created.id, startedAt };
+}
+
+export async function finishWeeklyReportRun(id: number, input: { status: "succeeded" | "failed" | "skipped"; reportId?: number | null; error?: string | null }) {
+  const db = await getDb();
+  if (!db) throw new Error("Database is not available");
+  await db.update(weeklyReportRuns).set({ status: input.status, reportId: input.reportId ?? null, error: input.error ?? null, finishedAt: new Date() }).where(eq(weeklyReportRuns.id, id));
+}
+
+export async function listWeeklyReportRuns(userId: number) {
+  const db = await getDb();
+  if (!db) throw new Error("Database is not available");
+  return db.select().from(weeklyReportRuns).where(eq(weeklyReportRuns.userId, userId)).orderBy(desc(weeklyReportRuns.startedAt)).limit(12);
 }
 
 export async function saveWeeklyReport(userId: number, input: Omit<typeof weeklyReports.$inferInsert, "id" | "userId" | "createdAt" | "updatedAt">) {

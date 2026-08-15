@@ -11,18 +11,32 @@ import { generateWeeklyReport } from "../weekly-report";
 export const WEEKLY_REPORT_CRON = "0 0 0 * * 1";
 const WEEKLY_REPORT_PATH = "/api/scheduled/weekly-report";
 
-function getSessionToken(cookieHeader: string | undefined) {
-  const token = parseCookie(cookieHeader ?? "")[COOKIE_NAME];
+function getSessionToken(cookieHeader: string | undefined, authorization: string | undefined) {
+  const token = parseCookie(cookieHeader ?? "")[COOKIE_NAME] ?? authorization?.match(/^Bearer\s+(.+)$/i)?.[1];
   if (!token) throw new TRPCError({ code: "UNAUTHORIZED", message: "スケジュールの設定には有効なログインセッションが必要です。" });
   return token;
 }
 
+async function generateWithRun(userId: number, trigger: "manual" | "retry") {
+  const run = await db.createWeeklyReportRun(userId, { trigger });
+  try {
+    const result = await generateWeeklyReport(userId, "manual", true);
+    await db.finishWeeklyReportRun(run.id, { status: "succeeded", reportId: result.report.id });
+    return { ...result, runId: run.id };
+  } catch (error) {
+    await db.finishWeeklyReportRun(run.id, { status: "failed", error: error instanceof Error ? error.message : String(error) });
+    throw error;
+  }
+}
+
 export const weeklyReportsRouter = router({
   list: protectedProcedure.query(({ ctx }) => db.listWeeklyReports(ctx.user.id)),
-  generate: protectedProcedure.mutation(({ ctx }) => generateWeeklyReport(ctx.user.id, "manual", true)),
+  runs: protectedProcedure.query(({ ctx }) => db.listWeeklyReportRuns(ctx.user.id)),
+  generate: protectedProcedure.mutation(({ ctx }) => generateWithRun(ctx.user.id, "manual")),
+  retry: protectedProcedure.mutation(({ ctx }) => generateWithRun(ctx.user.id, "retry")),
   schedule: protectedProcedure.input(z.object({ enabled: z.boolean() })).mutation(async ({ ctx, input }) => {
     const settings = await db.getGrowthSettings(ctx.user.id);
-    const sessionToken = getSessionToken(ctx.req.headers.cookie);
+    const sessionToken = getSessionToken(ctx.req.headers.cookie, ctx.req.headers.authorization);
     if (!input.enabled) {
       if (settings.weeklyReportCronTaskUid) await updateHeartbeatJob(settings.weeklyReportCronTaskUid, { enable: false }, sessionToken);
       return db.updateWeeklyReportSchedule(ctx.user.id, { weeklyReportEnabled: false });

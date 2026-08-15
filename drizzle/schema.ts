@@ -14,7 +14,7 @@ export const users = mysqlTable("users", {
 
 export const ideas = mysqlTable("ideas", {
   id: int("id").autoincrement().primaryKey(),
-  userId: int("userId").notNull(),
+  userId: int("userId").notNull().references(() => users.id, { onDelete: "cascade" }),
   title: varchar("title", { length: 180 }).notNull(),
   summary: text("summary"),
   category: varchar("category", { length: 80 }).notNull(),
@@ -31,8 +31,8 @@ export const ideas = mysqlTable("ideas", {
 
 export const postDrafts = mysqlTable("postDrafts", {
   id: int("id").autoincrement().primaryKey(),
-  userId: int("userId").notNull(),
-  ideaId: int("ideaId"),
+  userId: int("userId").notNull().references(() => users.id, { onDelete: "cascade" }),
+  ideaId: int("ideaId").references(() => ideas.id, { onDelete: "set null" }),
   content: varchar("content", { length: 2000 }).notNull(),
   tone: varchar("tone", { length: 80 }).notNull(),
   charLimit: int("charLimit").notNull(),
@@ -47,9 +47,9 @@ export const postDrafts = mysqlTable("postDrafts", {
 
 export const postResults = mysqlTable("postResults", {
   id: int("id").autoincrement().primaryKey(),
-  userId: int("userId").notNull(),
-  ideaId: int("ideaId"),
-  draftId: int("draftId"),
+  userId: int("userId").notNull().references(() => users.id, { onDelete: "cascade" }),
+  ideaId: int("ideaId").references(() => ideas.id, { onDelete: "set null" }),
+  draftId: int("draftId").references(() => postDrafts.id, { onDelete: "set null" }),
   title: varchar("title", { length: 180 }).notNull(),
   category: varchar("category", { length: 80 }).notNull(),
   postUrl: varchar("postUrl", { length: 2048 }),
@@ -68,7 +68,7 @@ export const postResults = mysqlTable("postResults", {
 
 export const growthSettings = mysqlTable("growthSettings", {
   id: int("id").autoincrement().primaryKey(),
-  userId: int("userId").notNull(),
+  userId: int("userId").notNull().references(() => users.id, { onDelete: "cascade" }),
   impressionsTarget: int("impressionsTarget").default(1000).notNull(),
   engagementRateTargetBps: int("engagementRateTargetBps").default(300).notNull(),
   postsPerWeekTarget: int("postsPerWeekTarget").default(3).notNull(),
@@ -84,7 +84,7 @@ export const growthSettings = mysqlTable("growthSettings", {
 
 export const weeklyReports = mysqlTable("weeklyReports", {
   id: int("id").autoincrement().primaryKey(),
-  userId: int("userId").notNull(),
+  userId: int("userId").notNull().references(() => users.id, { onDelete: "cascade" }),
   weekStart: datetime("weekStart").notNull(),
   weekEnd: datetime("weekEnd").notNull(),
   source: mysqlEnum("source", ["manual", "scheduled"]).notNull(),
@@ -100,6 +100,19 @@ export const weeklyReports = mysqlTable("weeklyReports", {
   updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
 }, table => [uniqueIndex("weekly_reports_user_week_unique").on(table.userId, table.weekStart), index("weekly_reports_user_created_idx").on(table.userId, table.createdAt)]);
 
+export const weeklyReportRuns = mysqlTable("weeklyReportRuns", {
+  id: int("id").autoincrement().primaryKey(),
+  userId: int("userId").notNull().references(() => users.id, { onDelete: "cascade" }),
+  taskUid: varchar("taskUid", { length: 65 }),
+  trigger: mysqlEnum("trigger", ["manual", "scheduled", "retry"]).notNull(),
+  status: mysqlEnum("status", ["running", "succeeded", "failed", "skipped"]).notNull(),
+  reportId: int("reportId").references(() => weeklyReports.id, { onDelete: "set null" }),
+  error: text("error"),
+  startedAt: datetime("startedAt").notNull(),
+  finishedAt: datetime("finishedAt"),
+  createdAt: timestamp("createdAt").defaultNow().notNull(),
+}, table => [index("weekly_report_runs_user_started_idx").on(table.userId, table.startedAt), index("weekly_report_runs_task_started_idx").on(table.taskUid, table.startedAt)]);
+
 export type User = typeof users.$inferSelect;
 export type InsertUser = typeof users.$inferInsert;
 export type Idea = typeof ideas.$inferSelect;
@@ -107,3 +120,4 @@ export type PostDraft = typeof postDrafts.$inferSelect;
 export type PostResult = typeof postResults.$inferSelect;
 export type GrowthSettings = typeof growthSettings.$inferSelect;
 export type WeeklyReport = typeof weeklyReports.$inferSelect;
+export type WeeklyReportRun = typeof weeklyReportRuns.$inferSelect;

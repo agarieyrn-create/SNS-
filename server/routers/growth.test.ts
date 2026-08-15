@@ -14,6 +14,7 @@ vi.mock("../db", () => ({
   createDrafts: vi.fn(),
   listResults: vi.fn(),
   createResult: vi.fn(),
+  previewResultImport: vi.fn(),
   importResults: vi.fn(),
   updateResult: vi.fn(),
   deleteResult: vi.fn(),
@@ -95,6 +96,19 @@ describe("growth router", () => {
     expect(db.deleteDraft).toHaveBeenCalledWith(user.id, 5);
   });
 
+  it("rewrites weak drafts with the selected AI model and re-scores the result", async () => {
+    const draft = { id: 21, userId: user.id, content: "絶対にすごいです", tone: "端的", charLimit: 280, status: "generated", warnings: ["禁止ワード「絶対」が含まれています。"], charCount: 10, readabilityScore: 70, qualityScore: 48, ideaId: null, createdAt: new Date(), updatedAt: new Date() };
+    vi.mocked(db.listDrafts).mockResolvedValue([draft] as never);
+    vi.mocked(invokeLLM).mockResolvedValue({ choices: [{ message: { content: JSON.stringify({ content: "観察を先に残すと、次の判断が具体的になります。" }) } }] } as never);
+    vi.mocked(db.updateDraft).mockResolvedValue({ ...draft, content: "観察を先に残すと、次の判断が具体的になります。", qualityScore: 88 } as never);
+
+    const result = await caller.drafts.rewrite({ id: 21, model: "gpt-5-mini" });
+
+    expect(invokeLLM).toHaveBeenCalledWith(expect.objectContaining({ model: "gpt-5-mini" }));
+    expect(db.updateDraft).toHaveBeenCalledWith(user.id, 21, "観察を先に残すと、次の判断が具体的になります。", "端的", 280, "generated", settings.bannedWords);
+    expect(result.after.qualityScore).toBeGreaterThan(result.before.qualityScore);
+  });
+
   it("records, updates, and deletes manual performance data", async () => {
     const resultInput = { title: "投稿後の振り返り", category: "AI × 業務効率化", postUrl: null, postedAt: new Date("2026-08-14T10:00:00.000Z"), impressions: 1200, engagements: 48, likes: 30, replies: 5, reposts: 4, bookmarks: 6, clicks: 3, notes: "朝に投稿" };
     vi.mocked(db.createResult).mockResolvedValue({ id: 9, userId: user.id, ...resultInput } as never);
@@ -110,9 +124,16 @@ describe("growth router", () => {
 
   it("imports validated performance rows into the signed-in workspace", async () => {
     const row = { ideaId: null, draftId: null, title: "CSVからの投稿", category: "AI × 業務効率化", postUrl: null, postedAt: new Date("2026-08-14T10:00:00.000Z"), impressions: 900, engagements: 34, likes: 20, replies: 4, reposts: 3, bookmarks: 5, clicks: 2, notes: "インポート" };
-    vi.mocked(db.importResults).mockResolvedValue({ imported: 1 });
-    await expect(caller.results.import({ rows: [row] })).resolves.toEqual({ imported: 1 });
+    vi.mocked(db.importResults).mockResolvedValue({ imported: 1, duplicates: 0, duplicateRows: [] });
+    await expect(caller.results.import({ rows: [row] })).resolves.toEqual({ imported: 1, duplicates: 0, duplicateRows: [] });
     expect(db.importResults).toHaveBeenCalledWith(user.id, [row]);
+  });
+
+  it("previews duplicate CSV rows before importing them", async () => {
+    const row = { ideaId: null, draftId: null, title: "重複候補", category: "AI × 業務効率化", postUrl: "https://x.com/example/status/1", postedAt: new Date("2026-08-14T10:00:00.000Z"), impressions: 900, engagements: 34, likes: 20, replies: 4, reposts: 3, bookmarks: 5, clicks: 2, notes: null };
+    vi.mocked(db.previewResultImport).mockResolvedValue({ accepted: 0, duplicateRows: [2] });
+    await expect(caller.results.previewImport({ rows: [row] })).resolves.toEqual({ accepted: 0, duplicateRows: [2] });
+    expect(db.previewResultImport).toHaveBeenCalledWith(user.id, [row]);
   });
 
   it("returns the aggregated dashboard exactly for the signed-in workspace", async () => {

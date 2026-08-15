@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { TrpcContext } from "../_core/context";
 
-vi.mock("../db", () => ({ listWeeklyReports: vi.fn(), getGrowthSettings: vi.fn(), updateWeeklyReportSchedule: vi.fn() }));
+vi.mock("../db", () => ({ listWeeklyReports: vi.fn(), listWeeklyReportRuns: vi.fn(), createWeeklyReportRun: vi.fn(), finishWeeklyReportRun: vi.fn(), getGrowthSettings: vi.fn(), updateWeeklyReportSchedule: vi.fn() }));
 vi.mock("../weekly-report", () => ({ generateWeeklyReport: vi.fn() }));
 vi.mock("../_core/heartbeat", () => ({ createHeartbeatJob: vi.fn(), updateHeartbeatJob: vi.fn() }));
 
@@ -20,8 +20,11 @@ beforeEach(() => vi.clearAllMocks());
 describe("weeklyReports router", () => {
   it("generates a report manually for the signed-in user", async () => {
     const generated = { report: { id: 8 }, created: true };
+    vi.mocked(db.createWeeklyReportRun).mockResolvedValue({ id: 4, startedAt: new Date() } as never);
     vi.mocked(generateWeeklyReport).mockResolvedValue(generated as never);
-    await expect(caller.generate()).resolves.toEqual(generated);
+    await expect(caller.generate()).resolves.toEqual({ ...generated, runId: 4 });
+    expect(db.createWeeklyReportRun).toHaveBeenCalledWith(user.id, { trigger: "manual" });
+    expect(db.finishWeeklyReportRun).toHaveBeenCalledWith(4, { status: "succeeded", reportId: 8 });
     expect(generateWeeklyReport).toHaveBeenCalledWith(user.id, "manual", true);
   });
 
@@ -35,6 +38,17 @@ describe("weeklyReports router", () => {
     expect(createHeartbeatJob).toHaveBeenCalledWith(expect.objectContaining({ cron: WEEKLY_REPORT_CRON, path: "/api/scheduled/weekly-report" }), "session-token");
     expect(db.updateWeeklyReportSchedule).toHaveBeenCalledWith(user.id, { weeklyReportEnabled: true, weeklyReportCronTaskUid: "weekly-task" });
     expect(result).toEqual(expect.objectContaining({ nextExecutionAt: "2026-08-17T15:00:00.000Z" }));
+  });
+
+  it("uses a Bearer session token when a cookie is unavailable", async () => {
+    const bearerCaller = weeklyReportsRouter.createCaller({ ...ctx, req: { headers: { authorization: "Bearer bearer-session-token" } } } as TrpcContext);
+    vi.mocked(db.getGrowthSettings).mockResolvedValue(scheduleSettings as never);
+    vi.mocked(createHeartbeatJob).mockResolvedValue({ taskUid: "weekly-task", nextExecutionAt: null });
+    vi.mocked(db.updateWeeklyReportSchedule).mockResolvedValue({ ...scheduleSettings, weeklyReportCronTaskUid: "weekly-task" } as never);
+
+    await bearerCaller.schedule({ enabled: true });
+
+    expect(createHeartbeatJob).toHaveBeenCalledWith(expect.objectContaining({ path: "/api/scheduled/weekly-report" }), "bearer-session-token");
   });
 
   it("pauses an existing schedule when automatic generation is disabled", async () => {

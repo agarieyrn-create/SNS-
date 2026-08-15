@@ -63,6 +63,38 @@ export const growthRouter = router({
       const settings = await db.getGrowthSettings(ctx.user.id);
       return db.updateDraft(ctx.user.id, input.id, input.content, input.tone, input.charLimit, input.status, settings.bannedWords);
     }),
+    rewrite: protectedProcedure.input(z.object({ id: z.number().int().positive(), model: z.string().trim().min(1).max(120) })).mutation(async ({ ctx, input }) => {
+      const draft = (await db.listDrafts(ctx.user.id)).find(item => item.id === input.id);
+      if (!draft) throw new TRPCError({ code: "NOT_FOUND", message: "投稿案が見つかりません。" });
+      const settings = await db.getGrowthSettings(ctx.user.id);
+      const response = await invokeLLM({
+        model: input.model,
+        messages: [
+          { role: "system", content: "あなたは日本語SNSの編集者です。事実を追加・捏造せず、禁止表現と文字数を守り、編集後の投稿本文だけをJSONで返します。" },
+          { role: "user", content: [
+            `元の投稿案: ${draft.content}`,
+            `トーン: ${draft.tone}`,
+            `上限文字数: ${draft.charLimit}字`,
+            `禁止ワード: ${settings.bannedWords.join("、") || "なし"}`,
+            `運用ルール: ${settings.analysisRules || "なし"}`,
+            `品質警告: ${draft.warnings.join("、") || "特になし"}`,
+            "警告を解消しつつ、具体性・一次体験・読みやすさを高めて書き直してください。",
+          ].join("\n") },
+        ],
+        response_format: {
+          type: "json_schema",
+          json_schema: { name: "rewritten_social_post", strict: true, schema: { type: "object", properties: { content: { type: "string", minLength: 1, maxLength: 2000 } }, required: ["content"], additionalProperties: false } },
+        },
+      });
+      const content = response.choices[0]?.message.content;
+      if (typeof content !== "string") throw new TRPCError({ code: "BAD_GATEWAY", message: "AIから改善案を取得できませんでした。" });
+      let parsed: { content: string };
+      try { parsed = JSON.parse(content); } catch { throw new TRPCError({ code: "BAD_GATEWAY", message: "AIの改善案を読み取れませんでした。" }); }
+      const rewritten = parsed.content.trim();
+      if (!rewritten) throw new TRPCError({ code: "BAD_GATEWAY", message: "AIの改善案が空でした。" });
+      const updated = await db.updateDraft(ctx.user.id, draft.id, rewritten, draft.tone, draft.charLimit, draft.status, settings.bannedWords);
+      return { draft: updated, before: reviewPost(draft.content, draft.charLimit, settings.bannedWords), after: reviewPost(rewritten, draft.charLimit, settings.bannedWords) };
+    }),
     delete: protectedProcedure.input(z.object({ id: z.number().int().positive() })).mutation(({ ctx, input }) => db.deleteDraft(ctx.user.id, input.id)),
   }),
   generate: protectedProcedure.input(z.object({
@@ -129,6 +161,7 @@ export const growthRouter = router({
       return db.updateResult(ctx.user.id, id, updates);
     }),
     delete: protectedProcedure.input(z.object({ id: z.number().int().positive() })).mutation(({ ctx, input }) => db.deleteResult(ctx.user.id, input.id)),
+    previewImport: protectedProcedure.input(z.object({ rows: z.array(importedResultInput).min(1).max(500) })).mutation(({ ctx, input }) => db.previewResultImport(ctx.user.id, input.rows)),
     import: protectedProcedure.input(z.object({ rows: z.array(importedResultInput).min(1).max(500) })).mutation(({ ctx, input }) => db.importResults(ctx.user.id, input.rows)),
   }),
   settings: router({
