@@ -52,4 +52,12 @@ describe("AiProviderSettings monthly limit display", () => {
     render(<AiProviderSettings />);
     expect(screen.getByRole("alert").textContent).toContain("月額上限");
   });
+
+  it("shows both immediate and save-after-test actions for a registered provider", () => {
+    listQuery.mockReturnValue({ data: { providers: [makeProvider()], defaults }, isLoading: false });
+    render(<AiProviderSettings />);
+    expect(screen.getByRole("button", { name: "接続をテスト" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "保存して再テスト" })).toBeTruthy();
+    expect(screen.getByText("未テストです。キーが正しいか確認してください。")).toBeTruthy();
+  });
 });
