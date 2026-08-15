@@ -33,6 +33,8 @@ export function decryptApiKey(value: EncryptedApiKey) {
 }
 
 type CompletionInput = { system: string; prompt: string };
+export type ProviderGeneration = { content: string; inputTokens?: number; outputTokens?: number; actualCostMilliUsd?: number };
+type UsageHooks<T extends ProviderConnectionForUse> = { reserve: (connection: T) => Promise<number>; success: (connection: T, recordId: number, result: ProviderGeneration) => Promise<void>; failure: (connection: T, recordId: number, error: Error) => Promise<void> };
 
 async function requestJson(url: string, init: RequestInit, provider: string) {
   const controller = new AbortController();
@@ -54,12 +56,14 @@ async function requestJson(url: string, init: RequestInit, provider: string) {
   }
 }
 
-function getChatCompletionContent(payload: Record<string, unknown>, provider: string) {
+function getChatCompletionContent(payload: Record<string, unknown>, provider: string): ProviderGeneration {
   const choices = Array.isArray(payload.choices) ? payload.choices : [];
   const message = choices[0] && typeof choices[0] === "object" ? (choices[0] as Record<string, unknown>).message as Record<string, unknown> | undefined : undefined;
   const content = message?.content;
   if (typeof content !== "string" || !content.trim()) throw new Error(`${provider}から投稿案を取得できませんでした。`);
-  return content.trim();
+  const usage = payload.usage as Record<string, unknown> | undefined;
+  const actualCost = typeof usage?.cost === "number" ? Math.max(0, Math.round(usage.cost * 1000)) : undefined;
+  return { content: content.trim(), inputTokens: typeof usage?.prompt_tokens === "number" ? usage.prompt_tokens : undefined, outputTokens: typeof usage?.completion_tokens === "number" ? usage.completion_tokens : undefined, actualCostMilliUsd: actualCost };
 }
 
 async function generateOpenAiCompatible(url: string, apiKey: string, model: string, input: CompletionInput, provider: string, headers: Record<string, string> = {}) {
@@ -71,7 +75,7 @@ async function generateOpenAiCompatible(url: string, apiKey: string, model: stri
   return getChatCompletionContent(payload, provider);
 }
 
-async function generateAnthropic(apiKey: string, model: string, input: CompletionInput) {
+async function generateAnthropic(apiKey: string, model: string, input: CompletionInput): Promise<ProviderGeneration> {
   const payload = await requestJson("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: { "x-api-key": apiKey, "anthropic-version": "2023-06-01", "Content-Type": "application/json" },
@@ -80,10 +84,11 @@ async function generateAnthropic(apiKey: string, model: string, input: Completio
   const blocks = Array.isArray(payload.content) ? payload.content : [];
   const text = blocks.find(block => block && typeof block === "object" && (block as Record<string, unknown>).type === "text") as Record<string, unknown> | undefined;
   if (typeof text?.text !== "string" || !text.text.trim()) throw new Error("Claudeから投稿案を取得できませんでした。");
-  return text.text.trim();
+  const usage = payload.usage as Record<string, unknown> | undefined;
+  return { content: text.text.trim(), inputTokens: typeof usage?.input_tokens === "number" ? usage.input_tokens : undefined, outputTokens: typeof usage?.output_tokens === "number" ? usage.output_tokens : undefined };
 }
 
-async function generateGemini(apiKey: string, model: string, input: CompletionInput) {
+async function generateGemini(apiKey: string, model: string, input: CompletionInput): Promise<ProviderGeneration> {
   const encodedModel = encodeURIComponent(model);
   const payload = await requestJson(`https://generativelanguage.googleapis.com/v1beta/models/${encodedModel}:generateContent?key=${encodeURIComponent(apiKey)}`, {
     method: "POST",
@@ -96,10 +101,11 @@ async function generateGemini(apiKey: string, model: string, input: CompletionIn
   const parts = Array.isArray(content?.parts) ? content.parts : [];
   const text = parts.find(part => part && typeof part === "object" && typeof (part as Record<string, unknown>).text === "string") as Record<string, unknown> | undefined;
   if (typeof text?.text !== "string" || !text.text.trim()) throw new Error("Geminiから投稿案を取得できませんでした。");
-  return text.text.trim();
+  const usage = payload.usageMetadata as Record<string, unknown> | undefined;
+  return { content: text.text.trim(), inputTokens: typeof usage?.promptTokenCount === "number" ? usage.promptTokenCount : undefined, outputTokens: typeof usage?.candidatesTokenCount === "number" ? usage.candidatesTokenCount : undefined };
 }
 
-export async function generateWithProvider(connection: ProviderConnectionForUse, input: CompletionInput) {
+export async function generateWithProvider(connection: ProviderConnectionForUse, input: CompletionInput): Promise<ProviderGeneration> {
   const apiKey = decryptApiKey(connection);
   switch (connection.provider) {
     case "openai": return generateOpenAiCompatible("https://api.openai.com/v1/chat/completions", apiKey, connection.model, input, "OpenAI");
@@ -109,15 +115,21 @@ export async function generateWithProvider(connection: ProviderConnectionForUse,
   }
 }
 
-export async function generateWithProviderPriority(connections: ProviderConnectionForUse[], input: CompletionInput, useBuiltIn: () => Promise<string>) {
+export async function generateWithProviderPriority<T extends ProviderConnectionForUse>(connections: T[], input: CompletionInput, useBuiltIn: () => Promise<string>, hooks?: UsageHooks<T>) {
   const enabled = connections.filter(connection => connection.enabled).sort((left, right) => left.priority - right.priority);
   if (!enabled.length) return { content: await useBuiltIn(), provider: "built_in" as const, failures: [] as string[] };
   const failures: string[] = [];
   for (const connection of enabled) {
+    let recordId: number | undefined;
     try {
-      return { content: await generateWithProvider(connection, input), provider: connection.provider, failures };
+      recordId = hooks ? await hooks.reserve(connection) : undefined;
+      const result = await generateWithProvider(connection, input);
+      if (hooks && recordId !== undefined) await hooks.success(connection, recordId, result);
+      return { ...result, provider: connection.provider, failures };
     } catch (error) {
-      failures.push(error instanceof Error ? error.message : `${providerDefaults[connection.provider].label}への接続に失敗しました。`);
+      const failure = error instanceof Error ? error : new Error(`${providerDefaults[connection.provider].label}への接続に失敗しました。`);
+      if (hooks && recordId !== undefined) await hooks.failure(connection, recordId, failure);
+      failures.push(failure.message);
     }
   }
   throw new Error(`設定済みのAIプロバイダーに接続できませんでした。${failures.join(" ")}`);

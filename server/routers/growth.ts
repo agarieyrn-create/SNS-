@@ -43,7 +43,7 @@ const importedResultInput = resultInput.extend({
 
 const aiProviderInput = z.enum(AI_PROVIDERS);
 
-async function generateJsonWithConfiguredProvider(userId: number, input: { system: string; prompt: string; builtInModel: string; schema: any }) {
+async function generateJsonWithConfiguredProvider(userId: number, input: { system: string; prompt: string; builtInModel: string; schema: any; action: "generate" | "rewrite" }) {
   const connections = await db.getAiProviderConnectionsForUse(userId);
   return generateWithProviderPriority(connections, { system: input.system, prompt: input.prompt }, async () => {
     const response = await invokeLLM({
@@ -54,6 +54,10 @@ async function generateJsonWithConfiguredProvider(userId: number, input: { syste
     const content = response.choices[0]?.message.content;
     if (typeof content !== "string") throw new Error("内蔵AIから投稿案を取得できませんでした。");
     return content;
+  }, {
+    reserve: connection => db.reserveAiUsage(userId, connection, input.action),
+    success: (connection, recordId, result) => db.finishAiUsage(recordId, { status: "succeeded", inputTokens: result.inputTokens, outputTokens: result.outputTokens, chargedCostMilliUsd: result.actualCostMilliUsd }),
+    failure: (_connection, recordId, error) => db.finishAiUsage(recordId, { status: "failed", chargedCostMilliUsd: 0, error: error.message.slice(0, 1000) }),
   });
 }
 
@@ -68,7 +72,7 @@ export const growthRouter = router({
       providers: await db.listAiProviderConnections(ctx.user.id),
       defaults: AI_PROVIDERS.map(provider => ({ provider, ...providerDefaults[provider] })),
     })),
-    save: protectedProcedure.input(z.object({ provider: aiProviderInput, apiKey: z.string().trim().min(10).max(500).optional(), model: z.string().trim().min(1).max(160), enabled: z.boolean(), priority: z.number().int().min(1).max(4) })).mutation(({ ctx, input }) => db.saveAiProviderConnection(ctx.user.id, input)),
+    save: protectedProcedure.input(z.object({ provider: aiProviderInput, apiKey: z.string().trim().min(10).max(500).optional(), model: z.string().trim().min(1).max(160), enabled: z.boolean(), priority: z.number().int().min(1).max(4), monthlyRequestLimit: z.number().int().min(1).max(100000), monthlyBudgetMilliUsd: z.number().int().min(1).max(100000000), perRequestReservationMilliUsd: z.number().int().min(1).max(10000000) })).mutation(({ ctx, input }) => db.saveAiProviderConnection(ctx.user.id, input)),
     reorder: protectedProcedure.input(z.object({ priorities: z.array(z.object({ provider: aiProviderInput, priority: z.number().int().min(1).max(4), enabled: z.boolean() })).min(1).max(4) })).mutation(({ ctx, input }) => db.updateAiProviderPriority(ctx.user.id, input.priorities)),
     delete: protectedProcedure.input(z.object({ provider: aiProviderInput })).mutation(({ ctx, input }) => db.deleteAiProviderConnection(ctx.user.id, input.provider)),
   }),
@@ -105,7 +109,7 @@ export const growthRouter = router({
       ].join("\n");
       let content: string;
       try {
-        content = (await generateJsonWithConfiguredProvider(ctx.user.id, { system, prompt, builtInModel: input.model, schema: { name: "rewritten_social_post", strict: true, schema: { type: "object", properties: { content: { type: "string", minLength: 1, maxLength: 2000 } }, required: ["content"], additionalProperties: false } } })).content;
+        content = (await generateJsonWithConfiguredProvider(ctx.user.id, { system, prompt, builtInModel: input.model, action: "rewrite", schema: { name: "rewritten_social_post", strict: true, schema: { type: "object", properties: { content: { type: "string", minLength: 1, maxLength: 2000 } }, required: ["content"], additionalProperties: false } } })).content;
       } catch (error) {
         throw new TRPCError({ code: "BAD_GATEWAY", message: error instanceof Error ? error.message : "AIから改善案を取得できませんでした。" });
       }
@@ -143,6 +147,7 @@ export const growthRouter = router({
         system: "あなたは日本語SNS編集者です。過剰な煽りや事実の捏造をせず、指示されたJSONのみを返します。",
         prompt,
         builtInModel: input.model,
+        action: "generate",
         schema: { name: "social_post_drafts", strict: true, schema: { type: "object", properties: { posts: { type: "array", items: { type: "string" }, minItems: 1, maxItems: 5 } }, required: ["posts"], additionalProperties: false } },
       })).content;
     } catch (error) {

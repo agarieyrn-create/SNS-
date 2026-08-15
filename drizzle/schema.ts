@@ -92,9 +92,28 @@ export const aiProviderConnections = mysqlTable("aiProviderConnections", {
   model: varchar("model", { length: 160 }).notNull(),
   enabled: boolean("enabled").default(true).notNull(),
   priority: int("priority").default(1).notNull(),
+  monthlyRequestLimit: int("monthlyRequestLimit").default(100).notNull(),
+  monthlyBudgetMilliUsd: int("monthlyBudgetMilliUsd").default(1000).notNull(),
+  perRequestReservationMilliUsd: int("perRequestReservationMilliUsd").default(50).notNull(),
   createdAt: timestamp("createdAt").defaultNow().notNull(),
   updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
 }, table => [uniqueIndex("ai_provider_connection_user_provider_unique").on(table.userId, table.provider), index("ai_provider_connection_user_priority_idx").on(table.userId, table.priority)]);
+
+export const aiUsageRecords = mysqlTable("aiUsageRecords", {
+  id: int("id").autoincrement().primaryKey(),
+  userId: int("userId").notNull().references(() => users.id, { onDelete: "cascade" }),
+  connectionId: int("connectionId").references(() => aiProviderConnections.id, { onDelete: "set null" }),
+  provider: mysqlEnum("provider", ["openai", "anthropic", "gemini", "openrouter"]).notNull(),
+  action: mysqlEnum("action", ["generate", "rewrite"]).notNull(),
+  status: mysqlEnum("status", ["reserved", "succeeded", "failed"]).notNull(),
+  reservedCostMilliUsd: int("reservedCostMilliUsd").notNull(),
+  chargedCostMilliUsd: int("chargedCostMilliUsd"),
+  inputTokens: int("inputTokens"),
+  outputTokens: int("outputTokens"),
+  error: text("error"),
+  createdAt: timestamp("createdAt").defaultNow().notNull(),
+  completedAt: datetime("completedAt"),
+}, table => [index("ai_usage_records_user_provider_month_idx").on(table.userId, table.provider, table.createdAt), index("ai_usage_records_connection_month_idx").on(table.connectionId, table.createdAt)]);
 
 export const weeklyReports = mysqlTable("weeklyReports", {
   id: int("id").autoincrement().primaryKey(),
@@ -134,5 +153,6 @@ export type PostDraft = typeof postDrafts.$inferSelect;
 export type PostResult = typeof postResults.$inferSelect;
 export type GrowthSettings = typeof growthSettings.$inferSelect;
 export type AiProviderConnection = typeof aiProviderConnections.$inferSelect;
+export type AiUsageRecord = typeof aiUsageRecords.$inferSelect;
 export type WeeklyReport = typeof weeklyReports.$inferSelect;
 export type WeeklyReportRun = typeof weeklyReportRuns.$inferSelect;

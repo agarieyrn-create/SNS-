@@ -1,6 +1,6 @@
 import { and, desc, eq, gte, lt } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/mysql2";
-import { AiProviderConnection, aiProviderConnections, GrowthSettings, growthSettings, ideas, InsertUser, postDrafts, postResults, users, weeklyReportRuns, weeklyReports } from "../drizzle/schema";
+import { AiProviderConnection, aiProviderConnections, aiUsageRecords, GrowthSettings, growthSettings, ideas, InsertUser, postDrafts, postResults, users, weeklyReportRuns, weeklyReports } from "../drizzle/schema";
 import { calculateEngagementRate, makeTrend, reviewPost } from "./growth-utils";
 import { ENV } from "./_core/env";
 import { AiProvider, AI_PROVIDERS, encryptApiKey } from "./ai-provider-gateway";
@@ -71,16 +71,40 @@ export async function saveGrowthSettings(userId: number, updates: Omit<ReturnTyp
   return getGrowthSettings(userId);
 }
 
-export type AiProviderConnectionSummary = { provider: AiProvider; model: string; enabled: boolean; priority: number; registered: boolean };
+export type AiProviderConnectionSummary = { provider: AiProvider; model: string; enabled: boolean; priority: number; registered: boolean; monthlyRequestLimit: number; monthlyBudgetMilliUsd: number; perRequestReservationMilliUsd: number; monthlyRequestCount: number; monthlyCostMilliUsd: number };
+
+function monthRange(reference = new Date()) {
+  const start = new Date(Date.UTC(reference.getUTCFullYear(), reference.getUTCMonth(), 1));
+  const end = new Date(Date.UTC(reference.getUTCFullYear(), reference.getUTCMonth() + 1, 1));
+  return { start, end };
+}
+
+async function listCurrentMonthAiUsage(userId: number) {
+  const db = await getDb();
+  if (!db) throw new Error("Database is not available");
+  const { start, end } = monthRange();
+  return db.select().from(aiUsageRecords).where(and(eq(aiUsageRecords.userId, userId), gte(aiUsageRecords.createdAt, start), lt(aiUsageRecords.createdAt, end)));
+}
 
 export async function listAiProviderConnections(userId: number): Promise<AiProviderConnectionSummary[]> {
   const db = await getDb();
   if (!db) throw new Error("Database is not available");
-  const rows = await db.select().from(aiProviderConnections).where(eq(aiProviderConnections.userId, userId)).orderBy(aiProviderConnections.priority);
+  const [rows, usageRows] = await Promise.all([
+    db.select().from(aiProviderConnections).where(eq(aiProviderConnections.userId, userId)).orderBy(aiProviderConnections.priority),
+    listCurrentMonthAiUsage(userId),
+  ]);
   const byProvider = new Map(rows.map(row => [row.provider, row]));
+  const usageByProvider = new Map<AiProvider, { count: number; cost: number }>();
+  usageRows.filter(row => row.status !== "failed").forEach(row => {
+    const current = usageByProvider.get(row.provider) ?? { count: 0, cost: 0 };
+    current.count += 1;
+    current.cost += row.chargedCostMilliUsd ?? row.reservedCostMilliUsd;
+    usageByProvider.set(row.provider, current);
+  });
   return AI_PROVIDERS.map((provider, index) => {
     const row = byProvider.get(provider);
-    return { provider, model: row?.model ?? "", enabled: row?.enabled ?? false, priority: row?.priority ?? index + 1, registered: Boolean(row) };
+    const usage = usageByProvider.get(provider) ?? { count: 0, cost: 0 };
+    return { provider, model: row?.model ?? "", enabled: row?.enabled ?? false, priority: row?.priority ?? index + 1, registered: Boolean(row), monthlyRequestLimit: row?.monthlyRequestLimit ?? 100, monthlyBudgetMilliUsd: row?.monthlyBudgetMilliUsd ?? 1000, perRequestReservationMilliUsd: row?.perRequestReservationMilliUsd ?? 50, monthlyRequestCount: usage.count, monthlyCostMilliUsd: usage.cost };
   }).sort((left, right) => left.priority - right.priority);
 }
 
@@ -90,7 +114,7 @@ export async function getAiProviderConnectionsForUse(userId: number): Promise<Ai
   return db.select().from(aiProviderConnections).where(and(eq(aiProviderConnections.userId, userId), eq(aiProviderConnections.enabled, true))).orderBy(aiProviderConnections.priority);
 }
 
-export async function saveAiProviderConnection(userId: number, input: { provider: AiProvider; apiKey?: string; model: string; enabled: boolean; priority: number }) {
+export async function saveAiProviderConnection(userId: number, input: { provider: AiProvider; apiKey?: string; model: string; enabled: boolean; priority: number; monthlyRequestLimit: number; monthlyBudgetMilliUsd: number; perRequestReservationMilliUsd: number }) {
   const db = await getDb();
   if (!db) throw new Error("Database is not available");
   const existing = await db.select().from(aiProviderConnections).where(and(eq(aiProviderConnections.userId, userId), eq(aiProviderConnections.provider, input.provider))).limit(1);
@@ -98,9 +122,9 @@ export async function saveAiProviderConnection(userId: number, input: { provider
   if (!existing[0] && !apiKey) throw new Error("初回登録時はAPIキーを入力してください。");
   const encrypted = apiKey ? encryptApiKey(apiKey) : null;
   if (!existing[0]) {
-    await db.insert(aiProviderConnections).values({ userId, provider: input.provider, model: input.model, enabled: input.enabled, priority: input.priority, ...encrypted! });
+    await db.insert(aiProviderConnections).values({ userId, provider: input.provider, model: input.model, enabled: input.enabled, priority: input.priority, monthlyRequestLimit: input.monthlyRequestLimit, monthlyBudgetMilliUsd: input.monthlyBudgetMilliUsd, perRequestReservationMilliUsd: input.perRequestReservationMilliUsd, ...encrypted! });
   } else {
-    await db.update(aiProviderConnections).set({ model: input.model, enabled: input.enabled, priority: input.priority, ...(encrypted ?? {}) }).where(and(eq(aiProviderConnections.userId, userId), eq(aiProviderConnections.provider, input.provider)));
+    await db.update(aiProviderConnections).set({ model: input.model, enabled: input.enabled, priority: input.priority, monthlyRequestLimit: input.monthlyRequestLimit, monthlyBudgetMilliUsd: input.monthlyBudgetMilliUsd, perRequestReservationMilliUsd: input.perRequestReservationMilliUsd, ...(encrypted ?? {}) }).where(and(eq(aiProviderConnections.userId, userId), eq(aiProviderConnections.provider, input.provider)));
   }
   return listAiProviderConnections(userId);
 }
@@ -117,6 +141,29 @@ export async function deleteAiProviderConnection(userId: number, provider: AiPro
   if (!db) throw new Error("Database is not available");
   await db.delete(aiProviderConnections).where(and(eq(aiProviderConnections.userId, userId), eq(aiProviderConnections.provider, provider)));
   return listAiProviderConnections(userId);
+}
+
+export async function reserveAiUsage(userId: number, connection: AiProviderConnection, action: "generate" | "rewrite") {
+  const db = await getDb();
+  if (!db) throw new Error("Database is not available");
+  const usageRows = await listCurrentMonthAiUsage(userId);
+  const providerRows = usageRows.filter(row => row.connectionId === connection.id && row.status !== "failed");
+  const requestCount = providerRows.length;
+  const usedCostMilliUsd = providerRows.reduce((total, row) => total + (row.chargedCostMilliUsd ?? row.reservedCostMilliUsd), 0);
+  if (requestCount >= connection.monthlyRequestLimit) throw new Error(`${providerName(connection.provider)}の月間利用回数上限（${connection.monthlyRequestLimit}回）に達しました。`);
+  if (usedCostMilliUsd + connection.perRequestReservationMilliUsd > connection.monthlyBudgetMilliUsd) throw new Error(`${providerName(connection.provider)}の月間費用上限（$${(connection.monthlyBudgetMilliUsd / 1000).toFixed(2)}）に達するため、呼び出しを停止しました。`);
+  const [created] = await db.insert(aiUsageRecords).values({ userId, connectionId: connection.id, provider: connection.provider, action, status: "reserved", reservedCostMilliUsd: connection.perRequestReservationMilliUsd }).$returningId();
+  return created.id;
+}
+
+export async function finishAiUsage(recordId: number, input: { status: "succeeded" | "failed"; inputTokens?: number; outputTokens?: number; chargedCostMilliUsd?: number; error?: string }) {
+  const db = await getDb();
+  if (!db) throw new Error("Database is not available");
+  await db.update(aiUsageRecords).set({ ...input, completedAt: new Date() }).where(eq(aiUsageRecords.id, recordId));
+}
+
+function providerName(provider: AiProvider) {
+  return { openai: "OpenAI", anthropic: "Claude", gemini: "Gemini", openrouter: "OpenRouter" }[provider];
 }
 
 export async function listIdeas(userId: number) {

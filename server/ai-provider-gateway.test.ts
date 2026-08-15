@@ -32,4 +32,20 @@ describe("AI provider gateway", () => {
     expect(result.content).toContain("フォールバック成功");
     expect(result.failures).toHaveLength(1);
   });
+
+  it("skips a provider whose monthly reservation is denied and uses the next available provider", async () => {
+    const first = { provider: "openai" as const, model: "gpt-5-mini", enabled: true, priority: 1, ...encryptApiKey("first-key") };
+    const second = { provider: "openrouter" as const, model: "openai/gpt-5-mini", enabled: true, priority: 2, ...encryptApiKey("second-key") };
+    const reserve = vi.fn().mockRejectedValueOnce(new Error("OpenAIの月間利用回数上限（10回）に達しました。")).mockResolvedValueOnce(51);
+    const success = vi.fn().mockResolvedValue(undefined);
+    const failure = vi.fn().mockResolvedValue(undefined);
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ choices: [{ message: { content: '{"posts":["予算内の投稿案"]}' } }] }) }));
+
+    const result = await generateWithProviderPriority([first, second], input, vi.fn(), { reserve, success, failure });
+
+    expect(result.provider).toBe("openrouter");
+    expect(reserve).toHaveBeenCalledTimes(2);
+    expect(success).toHaveBeenCalledWith(second, 51, expect.objectContaining({ content: expect.stringContaining("予算内") }));
+    expect(failure).not.toHaveBeenCalled();
+  });
 });
