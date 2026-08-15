@@ -60,13 +60,13 @@ function DashboardLayoutContent({ children }: { children: React.ReactNode }) {
               </SidebarMenuItem>;
             })}
           </SidebarMenu>
-          {!isCollapsed && <div className="mt-8 rounded-2xl border border-white/10 bg-white/[.055] p-4">
+        </SidebarContent>
+        <SidebarFooter className="mt-auto space-y-3 p-3">
+          {!isCollapsed && <div className="shrink-0 rounded-2xl border border-white/10 bg-white/[.055] p-4">
             <Target className="mb-3 h-4 w-4 text-[oklch(0.76_0.12_75)]" />
             <p className="text-xs font-semibold">学びを、次の投稿へ。</p>
             <p className="mt-1 text-[11px] leading-relaxed text-sidebar-foreground/55">ネタから実績までを一つの流れで育てます。</p>
           </div>}
-        </SidebarContent>
-        <SidebarFooter className="p-3">
           {isAuthenticated ? <div className="flex items-center gap-3 rounded-xl border border-white/10 bg-white/5 p-2.5"><div className="grid h-8 w-8 place-items-center rounded-lg bg-white/10 text-xs font-bold">{user?.name?.slice(0, 1) ?? "U"}</div>{!isCollapsed && <div className="min-w-0"><p className="truncate text-xs font-semibold">{user?.name ?? "メンバー"}</p><p className="truncate text-[10px] text-sidebar-foreground/50">あなたのワークスペース</p></div>}</div> : <button onClick={() => startLogin()} className="flex w-full items-center gap-3 rounded-xl border border-white/10 bg-white/5 p-2.5 text-left text-xs font-semibold transition hover:bg-white/10"><LogIn className="h-4 w-4 shrink-0 text-[oklch(0.76_0.12_75)]" />{!isCollapsed && <span>ログインして始める</span>}</button>}
         </SidebarFooter>
       </Sidebar>
