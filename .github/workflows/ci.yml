@@ -16,6 +16,8 @@ jobs:
     name: Type check, test, and build
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    env:
+      JWT_SECRET: sns-growth-copilot-ci-test-secret
 
     steps:
       - name: Check out source
