@@ -82,6 +82,20 @@ export const growthSettings = mysqlTable("growthSettings", {
   updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
 }, table => [uniqueIndex("growth_settings_user_unique").on(table.userId), index("growth_settings_weekly_cron_idx").on(table.weeklyReportCronTaskUid)]);
 
+export const aiProviderConnections = mysqlTable("aiProviderConnections", {
+  id: int("id").autoincrement().primaryKey(),
+  userId: int("userId").notNull().references(() => users.id, { onDelete: "cascade" }),
+  provider: mysqlEnum("provider", ["openai", "anthropic", "gemini", "openrouter"]).notNull(),
+  encryptedApiKey: text("encryptedApiKey").notNull(),
+  encryptionIv: varchar("encryptionIv", { length: 24 }).notNull(),
+  encryptionTag: varchar("encryptionTag", { length: 32 }).notNull(),
+  model: varchar("model", { length: 160 }).notNull(),
+  enabled: boolean("enabled").default(true).notNull(),
+  priority: int("priority").default(1).notNull(),
+  createdAt: timestamp("createdAt").defaultNow().notNull(),
+  updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
+}, table => [uniqueIndex("ai_provider_connection_user_provider_unique").on(table.userId, table.provider), index("ai_provider_connection_user_priority_idx").on(table.userId, table.priority)]);
+
 export const weeklyReports = mysqlTable("weeklyReports", {
   id: int("id").autoincrement().primaryKey(),
   userId: int("userId").notNull().references(() => users.id, { onDelete: "cascade" }),
@@ -119,5 +133,6 @@ export type Idea = typeof ideas.$inferSelect;
 export type PostDraft = typeof postDrafts.$inferSelect;
 export type PostResult = typeof postResults.$inferSelect;
 export type GrowthSettings = typeof growthSettings.$inferSelect;
+export type AiProviderConnection = typeof aiProviderConnections.$inferSelect;
 export type WeeklyReport = typeof weeklyReports.$inferSelect;
 export type WeeklyReportRun = typeof weeklyReportRuns.$inferSelect;

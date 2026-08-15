@@ -4,6 +4,7 @@ import * as db from "../db";
 import { reviewPost } from "../growth-utils";
 import { invokeLLM, listLLMModels } from "../_core/llm";
 import { protectedProcedure, router } from "../_core/trpc";
+import { AI_PROVIDERS, generateWithProviderPriority, parseJsonResponse, providerDefaults } from "../ai-provider-gateway";
 
 const ideaInput = z.object({
   title: z.string().trim().min(1).max(180),
@@ -40,11 +41,36 @@ const importedResultInput = resultInput.extend({
   draftId: z.null().optional().default(null),
 });
 
+const aiProviderInput = z.enum(AI_PROVIDERS);
+
+async function generateJsonWithConfiguredProvider(userId: number, input: { system: string; prompt: string; builtInModel: string; schema: any }) {
+  const connections = await db.getAiProviderConnectionsForUse(userId);
+  return generateWithProviderPriority(connections, { system: input.system, prompt: input.prompt }, async () => {
+    const response = await invokeLLM({
+      model: input.builtInModel,
+      messages: [{ role: "system", content: input.system }, { role: "user", content: input.prompt }],
+      response_format: { type: "json_schema", json_schema: input.schema },
+    });
+    const content = response.choices[0]?.message.content;
+    if (typeof content !== "string") throw new Error("内蔵AIから投稿案を取得できませんでした。");
+    return content;
+  });
+}
+
 export const growthRouter = router({
   dashboard: protectedProcedure.query(({ ctx }) => db.getDashboard(ctx.user.id)),
   models: protectedProcedure.query(async () => {
     const catalog = await listLLMModels();
     return catalog.data.map(model => ({ id: model.id }));
+  }),
+  aiConnections: router({
+    list: protectedProcedure.query(async ({ ctx }) => ({
+      providers: await db.listAiProviderConnections(ctx.user.id),
+      defaults: AI_PROVIDERS.map(provider => ({ provider, ...providerDefaults[provider] })),
+    })),
+    save: protectedProcedure.input(z.object({ provider: aiProviderInput, apiKey: z.string().trim().min(10).max(500).optional(), model: z.string().trim().min(1).max(160), enabled: z.boolean(), priority: z.number().int().min(1).max(4) })).mutation(({ ctx, input }) => db.saveAiProviderConnection(ctx.user.id, input)),
+    reorder: protectedProcedure.input(z.object({ priorities: z.array(z.object({ provider: aiProviderInput, priority: z.number().int().min(1).max(4), enabled: z.boolean() })).min(1).max(4) })).mutation(({ ctx, input }) => db.updateAiProviderPriority(ctx.user.id, input.priorities)),
+    delete: protectedProcedure.input(z.object({ provider: aiProviderInput })).mutation(({ ctx, input }) => db.deleteAiProviderConnection(ctx.user.id, input.provider)),
   }),
   ideas: router({
     list: protectedProcedure.query(({ ctx }) => db.listIdeas(ctx.user.id)),
@@ -67,29 +93,24 @@ export const growthRouter = router({
       const draft = (await db.listDrafts(ctx.user.id)).find(item => item.id === input.id);
       if (!draft) throw new TRPCError({ code: "NOT_FOUND", message: "投稿案が見つかりません。" });
       const settings = await db.getGrowthSettings(ctx.user.id);
-      const response = await invokeLLM({
-        model: input.model,
-        messages: [
-          { role: "system", content: "あなたは日本語SNSの編集者です。事実を追加・捏造せず、禁止表現と文字数を守り、編集後の投稿本文だけをJSONで返します。" },
-          { role: "user", content: [
-            `元の投稿案: ${draft.content}`,
-            `トーン: ${draft.tone}`,
-            `上限文字数: ${draft.charLimit}字`,
-            `禁止ワード: ${settings.bannedWords.join("、") || "なし"}`,
-            `運用ルール: ${settings.analysisRules || "なし"}`,
-            `品質警告: ${draft.warnings.join("、") || "特になし"}`,
-            "警告を解消しつつ、具体性・一次体験・読みやすさを高めて書き直してください。",
-          ].join("\n") },
-        ],
-        response_format: {
-          type: "json_schema",
-          json_schema: { name: "rewritten_social_post", strict: true, schema: { type: "object", properties: { content: { type: "string", minLength: 1, maxLength: 2000 } }, required: ["content"], additionalProperties: false } },
-        },
-      });
-      const content = response.choices[0]?.message.content;
-      if (typeof content !== "string") throw new TRPCError({ code: "BAD_GATEWAY", message: "AIから改善案を取得できませんでした。" });
+      const system = "あなたは日本語SNSの編集者です。事実を追加・捏造せず、禁止表現と文字数を守り、編集後の投稿本文だけをJSONで返します。";
+      const prompt = [
+        `元の投稿案: ${draft.content}`,
+        `トーン: ${draft.tone}`,
+        `上限文字数: ${draft.charLimit}字`,
+        `禁止ワード: ${settings.bannedWords.join("、") || "なし"}`,
+        `運用ルール: ${settings.analysisRules || "なし"}`,
+        `品質警告: ${draft.warnings.join("、") || "特になし"}`,
+        "警告を解消しつつ、具体性・一次体験・読みやすさを高めて書き直してください。",
+      ].join("\n");
+      let content: string;
+      try {
+        content = (await generateJsonWithConfiguredProvider(ctx.user.id, { system, prompt, builtInModel: input.model, schema: { name: "rewritten_social_post", strict: true, schema: { type: "object", properties: { content: { type: "string", minLength: 1, maxLength: 2000 } }, required: ["content"], additionalProperties: false } } })).content;
+      } catch (error) {
+        throw new TRPCError({ code: "BAD_GATEWAY", message: error instanceof Error ? error.message : "AIから改善案を取得できませんでした。" });
+      }
       let parsed: { content: string };
-      try { parsed = JSON.parse(content); } catch { throw new TRPCError({ code: "BAD_GATEWAY", message: "AIの改善案を読み取れませんでした。" }); }
+      try { parsed = parseJsonResponse(content) as { content: string }; } catch { throw new TRPCError({ code: "BAD_GATEWAY", message: "AIの改善案を読み取れませんでした。" }); }
       const rewritten = parsed.content.trim();
       if (!rewritten) throw new TRPCError({ code: "BAD_GATEWAY", message: "AIの改善案が空でした。" });
       const updated = await db.updateDraft(ctx.user.id, draft.id, rewritten, draft.tone, draft.charLimit, draft.status, settings.bannedWords);
@@ -116,31 +137,20 @@ export const growthRouter = router({
       `運用ルール: ${settings.analysisRules ?? "なし"}`,
       "日本語のX投稿案を作成してください。曖昧な一般論を避け、本人の一次体験や具体的な学びを中心にします。ハッシュタグは多用せず、各案は単体で読めるようにしてください。",
     ].join("\n");
-    const response = await invokeLLM({
-      model: input.model,
-      messages: [
-        { role: "system", content: "あなたは日本語SNS編集者です。過剰な煽りや事実の捏造をせず、指示されたJSONのみを返します。" },
-        { role: "user", content: prompt },
-      ],
-      response_format: {
-        type: "json_schema",
-        json_schema: {
-          name: "social_post_drafts",
-          strict: true,
-          schema: {
-            type: "object",
-            properties: { posts: { type: "array", items: { type: "string" }, minItems: 1, maxItems: 5 } },
-            required: ["posts"],
-            additionalProperties: false,
-          },
-        },
-      },
-    });
-    const content = response.choices[0]?.message.content;
-    if (typeof content !== "string") throw new TRPCError({ code: "BAD_GATEWAY", message: "AIから投稿案を取得できませんでした。" });
+    let content: string;
+    try {
+      content = (await generateJsonWithConfiguredProvider(ctx.user.id, {
+        system: "あなたは日本語SNS編集者です。過剰な煽りや事実の捏造をせず、指示されたJSONのみを返します。",
+        prompt,
+        builtInModel: input.model,
+        schema: { name: "social_post_drafts", strict: true, schema: { type: "object", properties: { posts: { type: "array", items: { type: "string" }, minItems: 1, maxItems: 5 } }, required: ["posts"], additionalProperties: false } },
+      })).content;
+    } catch (error) {
+      throw new TRPCError({ code: "BAD_GATEWAY", message: error instanceof Error ? error.message : "AIから投稿案を取得できませんでした。" });
+    }
     let parsed: { posts: string[] };
     try {
-      parsed = JSON.parse(content);
+      parsed = parseJsonResponse(content) as { posts: string[] };
     } catch {
       throw new TRPCError({ code: "BAD_GATEWAY", message: "AIの応答形式を読み取れませんでした。" });
     }

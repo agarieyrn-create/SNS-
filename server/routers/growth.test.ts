@@ -20,6 +20,11 @@ vi.mock("../db", () => ({
   deleteResult: vi.fn(),
   getDashboard: vi.fn(),
   getExportData: vi.fn(),
+  getAiProviderConnectionsForUse: vi.fn(),
+  listAiProviderConnections: vi.fn(),
+  saveAiProviderConnection: vi.fn(),
+  updateAiProviderPriority: vi.fn(),
+  deleteAiProviderConnection: vi.fn(),
 }));
 
 vi.mock("../_core/llm", () => ({
@@ -43,6 +48,7 @@ const validIdea = { title: "AIに業務を教える前に観察する", summary:
 beforeEach(() => {
   vi.clearAllMocks();
   vi.mocked(db.getGrowthSettings).mockResolvedValue(settings);
+  vi.mocked(db.getAiProviderConnectionsForUse).mockResolvedValue([]);
 });
 
 describe("growth router", () => {
@@ -85,6 +91,20 @@ describe("growth router", () => {
   it("lists only model identifiers returned from the model catalog", async () => {
     vi.mocked(listLLMModels).mockResolvedValue({ data: [{ id: "gpt-5-mini" }, { id: "claude-haiku-4-5" }] } as never);
     await expect(caller.models()).resolves.toEqual([{ id: "gpt-5-mini" }, { id: "claude-haiku-4-5" }]);
+  });
+
+  it("lists only non-secret provider connection status for the signed-in user", async () => {
+    const connection = { provider: "openai", model: "gpt-5-mini", enabled: true, priority: 1, registered: true };
+    vi.mocked(db.listAiProviderConnections).mockResolvedValue([connection] as never);
+    const result = await caller.aiConnections.list();
+    expect(result.providers).toEqual([connection]);
+    expect(JSON.stringify(result)).not.toContain("apiKey");
+  });
+
+  it("saves provider priority and enabled state only for the signed-in user", async () => {
+    vi.mocked(db.updateAiProviderPriority).mockResolvedValue([] as never);
+    await caller.aiConnections.reorder({ priorities: [{ provider: "gemini", priority: 1, enabled: true }] });
+    expect(db.updateAiProviderPriority).toHaveBeenCalledWith(user.id, [{ provider: "gemini", priority: 1, enabled: true }]);
   });
 
   it("updates and deletes only the selected draft in the signed-in workspace", async () => {

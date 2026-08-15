@@ -1,8 +1,9 @@
 import { and, desc, eq, gte, lt } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/mysql2";
-import { GrowthSettings, growthSettings, ideas, InsertUser, postDrafts, postResults, users, weeklyReportRuns, weeklyReports } from "../drizzle/schema";
+import { AiProviderConnection, aiProviderConnections, GrowthSettings, growthSettings, ideas, InsertUser, postDrafts, postResults, users, weeklyReportRuns, weeklyReports } from "../drizzle/schema";
 import { calculateEngagementRate, makeTrend, reviewPost } from "./growth-utils";
 import { ENV } from "./_core/env";
+import { AiProvider, AI_PROVIDERS, encryptApiKey } from "./ai-provider-gateway";
 
 let _db: ReturnType<typeof drizzle> | null = null;
 
@@ -68,6 +69,54 @@ export async function saveGrowthSettings(userId: number, updates: Omit<ReturnTyp
   if (!db) throw new Error("Database is not available");
   await db.insert(growthSettings).values({ userId, ...updates }).onDuplicateKeyUpdate({ set: updates });
   return getGrowthSettings(userId);
+}
+
+export type AiProviderConnectionSummary = { provider: AiProvider; model: string; enabled: boolean; priority: number; registered: boolean };
+
+export async function listAiProviderConnections(userId: number): Promise<AiProviderConnectionSummary[]> {
+  const db = await getDb();
+  if (!db) throw new Error("Database is not available");
+  const rows = await db.select().from(aiProviderConnections).where(eq(aiProviderConnections.userId, userId)).orderBy(aiProviderConnections.priority);
+  const byProvider = new Map(rows.map(row => [row.provider, row]));
+  return AI_PROVIDERS.map((provider, index) => {
+    const row = byProvider.get(provider);
+    return { provider, model: row?.model ?? "", enabled: row?.enabled ?? false, priority: row?.priority ?? index + 1, registered: Boolean(row) };
+  }).sort((left, right) => left.priority - right.priority);
+}
+
+export async function getAiProviderConnectionsForUse(userId: number): Promise<AiProviderConnection[]> {
+  const db = await getDb();
+  if (!db) throw new Error("Database is not available");
+  return db.select().from(aiProviderConnections).where(and(eq(aiProviderConnections.userId, userId), eq(aiProviderConnections.enabled, true))).orderBy(aiProviderConnections.priority);
+}
+
+export async function saveAiProviderConnection(userId: number, input: { provider: AiProvider; apiKey?: string; model: string; enabled: boolean; priority: number }) {
+  const db = await getDb();
+  if (!db) throw new Error("Database is not available");
+  const existing = await db.select().from(aiProviderConnections).where(and(eq(aiProviderConnections.userId, userId), eq(aiProviderConnections.provider, input.provider))).limit(1);
+  const apiKey = input.apiKey?.trim();
+  if (!existing[0] && !apiKey) throw new Error("初回登録時はAPIキーを入力してください。");
+  const encrypted = apiKey ? encryptApiKey(apiKey) : null;
+  if (!existing[0]) {
+    await db.insert(aiProviderConnections).values({ userId, provider: input.provider, model: input.model, enabled: input.enabled, priority: input.priority, ...encrypted! });
+  } else {
+    await db.update(aiProviderConnections).set({ model: input.model, enabled: input.enabled, priority: input.priority, ...(encrypted ?? {}) }).where(and(eq(aiProviderConnections.userId, userId), eq(aiProviderConnections.provider, input.provider)));
+  }
+  return listAiProviderConnections(userId);
+}
+
+export async function updateAiProviderPriority(userId: number, priorities: Array<{ provider: AiProvider; priority: number; enabled: boolean }>) {
+  const db = await getDb();
+  if (!db) throw new Error("Database is not available");
+  await Promise.all(priorities.map(item => db.update(aiProviderConnections).set({ priority: item.priority, enabled: item.enabled }).where(and(eq(aiProviderConnections.userId, userId), eq(aiProviderConnections.provider, item.provider)))));
+  return listAiProviderConnections(userId);
+}
+
+export async function deleteAiProviderConnection(userId: number, provider: AiProvider) {
+  const db = await getDb();
+  if (!db) throw new Error("Database is not available");
+  await db.delete(aiProviderConnections).where(and(eq(aiProviderConnections.userId, userId), eq(aiProviderConnections.provider, provider)));
+  return listAiProviderConnections(userId);
 }
 
 export async function listIdeas(userId: number) {
