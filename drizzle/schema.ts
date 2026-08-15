@@ -95,6 +95,8 @@ export const aiProviderConnections = mysqlTable("aiProviderConnections", {
   monthlyRequestLimit: int("monthlyRequestLimit").default(100).notNull(),
   monthlyBudgetMilliUsd: int("monthlyBudgetMilliUsd").default(1000).notNull(),
   perRequestReservationMilliUsd: int("perRequestReservationMilliUsd").default(50).notNull(),
+  lastTestedAt: datetime("lastTestedAt"),
+  lastTestError: text("lastTestError"),
   createdAt: timestamp("createdAt").defaultNow().notNull(),
   updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
 }, table => [uniqueIndex("ai_provider_connection_user_provider_unique").on(table.userId, table.provider), index("ai_provider_connection_user_priority_idx").on(table.userId, table.priority)]);
@@ -104,7 +106,7 @@ export const aiUsageRecords = mysqlTable("aiUsageRecords", {
   userId: int("userId").notNull().references(() => users.id, { onDelete: "cascade" }),
   connectionId: int("connectionId").references(() => aiProviderConnections.id, { onDelete: "set null" }),
   provider: mysqlEnum("provider", ["openai", "anthropic", "gemini", "openrouter"]).notNull(),
-  action: mysqlEnum("action", ["generate", "rewrite"]).notNull(),
+  action: mysqlEnum("action", ["generate", "rewrite", "connection_test"]).notNull(),
   status: mysqlEnum("status", ["reserved", "succeeded", "failed"]).notNull(),
   reservedCostMilliUsd: int("reservedCostMilliUsd").notNull(),
   chargedCostMilliUsd: int("chargedCostMilliUsd"),

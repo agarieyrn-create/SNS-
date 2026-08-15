@@ -4,7 +4,7 @@ import * as db from "../db";
 import { reviewPost } from "../growth-utils";
 import { invokeLLM, listLLMModels } from "../_core/llm";
 import { protectedProcedure, router } from "../_core/trpc";
-import { AI_PROVIDERS, generateWithProviderPriority, parseJsonResponse, providerDefaults } from "../ai-provider-gateway";
+import { AI_PROVIDERS, generateWithProvider, generateWithProviderPriority, parseJsonResponse, providerDefaults } from "../ai-provider-gateway";
 
 const ideaInput = z.object({
   title: z.string().trim().min(1).max(180),
@@ -75,6 +75,23 @@ export const growthRouter = router({
     save: protectedProcedure.input(z.object({ provider: aiProviderInput, apiKey: z.string().trim().min(10).max(500).optional(), model: z.string().trim().min(1).max(160), enabled: z.boolean(), priority: z.number().int().min(1).max(4), monthlyRequestLimit: z.number().int().min(1).max(100000), monthlyBudgetMilliUsd: z.number().int().min(1).max(100000000), perRequestReservationMilliUsd: z.number().int().min(1).max(10000000) })).mutation(({ ctx, input }) => db.saveAiProviderConnection(ctx.user.id, input)),
     reorder: protectedProcedure.input(z.object({ priorities: z.array(z.object({ provider: aiProviderInput, priority: z.number().int().min(1).max(4), enabled: z.boolean() })).min(1).max(4) })).mutation(({ ctx, input }) => db.updateAiProviderPriority(ctx.user.id, input.priorities)),
     delete: protectedProcedure.input(z.object({ provider: aiProviderInput })).mutation(({ ctx, input }) => db.deleteAiProviderConnection(ctx.user.id, input.provider)),
+    usage: protectedProcedure.query(({ ctx }) => db.listAiUsageForCurrentMonth(ctx.user.id)),
+    test: protectedProcedure.input(z.object({ provider: aiProviderInput })).mutation(async ({ ctx, input }) => {
+      const connection = await db.getAiProviderConnection(ctx.user.id, input.provider);
+      let recordId: number | null = null;
+      try {
+        recordId = await db.reserveAiUsage(ctx.user.id, connection, "connection_test");
+        const result = await generateWithProvider(connection, { system: "You are a connectivity test. Reply with only OK.", prompt: "Return OK." });
+        await db.finishAiUsage(recordId, { status: "succeeded", inputTokens: result.inputTokens, outputTokens: result.outputTokens, chargedCostMilliUsd: result.actualCostMilliUsd });
+        await db.recordAiConnectionTest(connection.id, null);
+        return { success: true, testedAt: new Date() };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "AI接続テストに失敗しました。";
+        if (recordId) await db.finishAiUsage(recordId, { status: "failed", chargedCostMilliUsd: 0, error: message.slice(0, 1000) });
+        await db.recordAiConnectionTest(connection.id, message.slice(0, 1000));
+        throw new Error(message);
+      }
+    }),
   }),
   ideas: router({
     list: protectedProcedure.query(({ ctx }) => db.listIdeas(ctx.user.id)),

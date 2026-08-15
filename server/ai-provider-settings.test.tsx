@@ -4,17 +4,20 @@ import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 const listQuery = vi.fn();
+const usageQuery = vi.fn();
 
 vi.mock("../client/src/_core/hooks/useAuth", () => ({ useAuth: () => ({ isAuthenticated: true }) }));
 vi.mock("../client/src/lib/trpc", () => ({
   trpc: {
-    useUtils: () => ({ growth: { aiConnections: { list: { invalidate: vi.fn() } } } }),
+    useUtils: () => ({ growth: { aiConnections: { list: { invalidate: vi.fn() }, usage: { invalidate: vi.fn() } } } }),
     growth: {
       aiConnections: {
         list: { useQuery: () => listQuery() },
+        usage: { useQuery: () => usageQuery() },
         save: { useMutation: () => ({ mutate: vi.fn(), isPending: false }) },
         reorder: { useMutation: () => ({ mutate: vi.fn(), isPending: false }) },
         delete: { useMutation: () => ({ mutate: vi.fn(), isPending: false }) },
+        test: { useMutation: () => ({ mutate: vi.fn(), isPending: false, variables: null }) },
       },
     },
   },
@@ -30,11 +33,13 @@ const defaults = [
 ];
 
 function makeProvider(overrides: Record<string, unknown> = {}) {
-  return { provider: "openai", model: "gpt-5-mini", enabled: true, priority: 1, registered: true, monthlyRequestLimit: 10, monthlyBudgetMilliUsd: 1000, perRequestReservationMilliUsd: 50, monthlyRequestCount: 2, monthlyCostMilliUsd: 250, ...overrides };
+  return { provider: "openai", model: "gpt-5-mini", enabled: true, priority: 1, registered: true, monthlyRequestLimit: 10, monthlyBudgetMilliUsd: 1000, perRequestReservationMilliUsd: 50, monthlyRequestCount: 2, monthlyCostMilliUsd: 250, lastTestedAt: null, lastTestError: null, ...overrides };
 }
 
 describe("AiProviderSettings monthly limit display", () => {
   afterEach(() => cleanup());
+
+  usageQuery.mockReturnValue({ data: [], isLoading: false });
 
   it("renders the request-limit stop alert in the complete settings component", () => {
     listQuery.mockReturnValue({ data: { providers: [makeProvider({ monthlyRequestCount: 10 })], defaults }, isLoading: false });

@@ -22,6 +22,11 @@ vi.mock("../db", () => ({
   getExportData: vi.fn(),
   getAiProviderConnectionsForUse: vi.fn(),
   listAiProviderConnections: vi.fn(),
+  getAiProviderConnection: vi.fn(),
+  recordAiConnectionTest: vi.fn(),
+  listAiUsageForCurrentMonth: vi.fn(),
+  reserveAiUsage: vi.fn(),
+  finishAiUsage: vi.fn(),
   saveAiProviderConnection: vi.fn(),
   updateAiProviderPriority: vi.fn(),
   deleteAiProviderConnection: vi.fn(),
@@ -32,8 +37,14 @@ vi.mock("../_core/llm", () => ({
   invokeLLM: vi.fn(),
 }));
 
+vi.mock("../ai-provider-gateway", async importOriginal => {
+  const actual = await importOriginal<typeof import("../ai-provider-gateway")>();
+  return { ...actual, generateWithProvider: vi.fn() };
+});
+
 import * as db from "../db";
 import { invokeLLM, listLLMModels } from "../_core/llm";
+import { generateWithProvider } from "../ai-provider-gateway";
 import { growthRouter } from "./growth";
 
 const user = {
@@ -105,6 +116,25 @@ describe("growth router", () => {
     vi.mocked(db.updateAiProviderPriority).mockResolvedValue([] as never);
     await caller.aiConnections.reorder({ priorities: [{ provider: "gemini", priority: 1, enabled: true }] });
     expect(db.updateAiProviderPriority).toHaveBeenCalledWith(user.id, [{ provider: "gemini", priority: 1, enabled: true }]);
+  });
+
+  it("returns only the signed-in user's current month AI usage history", async () => {
+    const records = [{ id: 91, userId: user.id, provider: "openai", action: "generate", status: "succeeded", createdAt: new Date() }];
+    vi.mocked(db.listAiUsageForCurrentMonth).mockResolvedValue(records as never);
+    await expect(caller.aiConnections.usage()).resolves.toEqual(records);
+    expect(db.listAiUsageForCurrentMonth).toHaveBeenCalledWith(user.id);
+  });
+
+  it("tests a registered provider, records its usage, and stores the diagnostic result", async () => {
+    const connection = { id: 8, userId: user.id, provider: "openai", model: "gpt-5-mini", encryptedApiKey: "cipher", keyIv: "iv", keyAuthTag: "tag", enabled: true, priority: 1, monthlyRequestLimit: 10, monthlyBudgetMilliUsd: 1000, perRequestReservationMilliUsd: 50 };
+    vi.mocked(db.getAiProviderConnection).mockResolvedValue(connection as never);
+    vi.mocked(db.reserveAiUsage).mockResolvedValue(31);
+    vi.mocked(generateWithProvider).mockResolvedValue({ content: "OK", inputTokens: 3, outputTokens: 1, actualCostMilliUsd: 2 });
+
+    await expect(caller.aiConnections.test({ provider: "openai" })).resolves.toMatchObject({ success: true });
+    expect(db.reserveAiUsage).toHaveBeenCalledWith(user.id, connection, "connection_test");
+    expect(db.finishAiUsage).toHaveBeenCalledWith(31, expect.objectContaining({ status: "succeeded" }));
+    expect(db.recordAiConnectionTest).toHaveBeenCalledWith(connection.id, null);
   });
 
   it("updates and deletes only the selected draft in the signed-in workspace", async () => {
