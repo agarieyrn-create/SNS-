@@ -8,7 +8,7 @@ vi.mock("sonner", () => ({ toast: { success, error } }));
 import { DraftCard } from "../client/src/pages/GrowthCopilot";
 
 const draft = { id: 10, content: "AIの学びを投稿に変える。", qualityScore: 86, charCount: 15, charLimit: 280, readabilityScore: 92, warnings: [], status: "generated" };
-const props = { draft, onSave: vi.fn(), onRewrite: vi.fn(), onDelete: vi.fn(), onRecord: vi.fn(), saving: false, rewriting: false };
+const props = { draft, onSave: vi.fn(), onRewrite: vi.fn(), onDelete: vi.fn(), onRecord: vi.fn(), onSchedule: vi.fn(), saving: false, rewriting: false };
 
 describe("DraftCard sharing actions", () => {
   beforeEach(() => {

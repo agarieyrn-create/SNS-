@@ -30,6 +30,17 @@ vi.mock("../db", () => ({
   saveAiProviderConnection: vi.fn(),
   updateAiProviderPriority: vi.fn(),
   deleteAiProviderConnection: vi.fn(),
+  getXAccountConnectionSummary: vi.fn(),
+  getXAccountConnection: vi.fn(),
+  saveXAccountConnection: vi.fn(),
+  recordXAccountConnectionTest: vi.fn(),
+  deleteXAccountConnection: vi.fn(),
+  listScheduledPosts: vi.fn(),
+  listScheduledPostRuns: vi.fn(),
+  createScheduledPost: vi.fn(),
+  updateScheduledPost: vi.fn(),
+  cancelScheduledPost: vi.fn(),
+  retryScheduledPost: vi.fn(),
 }));
 
 vi.mock("../_core/llm", () => ({
@@ -42,6 +53,9 @@ vi.mock("../ai-provider-gateway", async importOriginal => {
   return { ...actual, generateWithProvider: vi.fn() };
 });
 
+vi.mock("../x-client", () => ({ testXConnection: vi.fn(), createXPost: vi.fn() }));
+vi.mock("../_core/heartbeat", () => ({ createHeartbeatJob: vi.fn(), updateHeartbeatJob: vi.fn() }));
+
 import * as db from "../db";
 import { invokeLLM, listLLMModels } from "../_core/llm";
 import { generateWithProvider } from "../ai-provider-gateway";
@@ -51,13 +65,14 @@ const user = {
   id: 42, openId: "growth-test-user", name: "Test User", email: "test@example.com", loginMethod: "manus" as const,
   role: "user" as const, createdAt: new Date(), updatedAt: new Date(), lastSignedIn: new Date(),
 };
-const ctx = { user, req: {} as TrpcContext["req"], res: {} as TrpcContext["res"] } as TrpcContext;
+const ctx = { user, req: { headers: { authorization: "Bearer test-session" } } as TrpcContext["req"], res: {} as TrpcContext["res"] } as TrpcContext;
 const caller = growthRouter.createCaller(ctx);
 const settings = { id: 1, userId: user.id, impressionsTarget: 1000, engagementRateTargetBps: 300, postsPerWeekTarget: 3, bannedWords: ["絶対"], analysisRules: "一次体験を中心にする。", defaultTone: "知的で親しみやすい", createdAt: new Date(), updatedAt: new Date() };
 const validIdea = { title: "AIに業務を教える前に観察する", summary: "観察から始める", category: "AI × 業務効率化", tags: ["AI"], sourceUrl: null, personalExperience: "実務で試した", targetUser: "非エンジニア", angle: "失敗からの学び", priority: "high" as const, status: "unused" as const };
 
 beforeEach(() => {
   vi.clearAllMocks();
+  (settings as typeof settings & { xScheduledPostCronTaskUid?: string | null }).xScheduledPostCronTaskUid = null;
   vi.mocked(db.getGrowthSettings).mockResolvedValue(settings);
   vi.mocked(db.getAiProviderConnectionsForUse).mockResolvedValue([]);
 });
@@ -135,6 +150,45 @@ describe("growth router", () => {
     expect(db.reserveAiUsage).toHaveBeenCalledWith(user.id, connection, "connection_test");
     expect(db.finishAiUsage).toHaveBeenCalledWith(31, expect.objectContaining({ status: "succeeded" }));
     expect(db.recordAiConnectionTest).toHaveBeenCalledWith(connection.id, null);
+  });
+
+  it("returns non-secret X connection status and saves credentials only for the signed-in user", async () => {
+    vi.mocked(db.getXAccountConnectionSummary).mockResolvedValue({ registered: true, lastTestedAt: new Date(), lastTestError: null });
+    await expect(caller.xConnection.status()).resolves.toMatchObject({ registered: true });
+    expect(db.getXAccountConnectionSummary).toHaveBeenCalledWith(user.id);
+    vi.mocked(db.saveXAccountConnection).mockResolvedValue({ registered: true, lastTestedAt: null, lastTestError: null });
+    await caller.xConnection.save({ apiKey: "api-key-test", apiSecret: "api-secret-test", accessToken: "access-token-test", accessTokenSecret: "access-token-secret-test" });
+    expect(db.saveXAccountConnection).toHaveBeenCalledWith(user.id, expect.objectContaining({ apiKey: "api-key-test", accessToken: "access-token-test" }));
+  });
+
+  it("prevents creating an X reservation before a successful connection test", async () => {
+    vi.mocked(db.getXAccountConnection).mockResolvedValue({ id: 9, lastTestedAt: null, lastTestError: null } as never);
+    await expect(caller.scheduledPosts.create({ draftId: null, content: "予約する投稿本文", scheduledFor: new Date(Date.now() + 120_000), timezone: "Asia/Tokyo" })).rejects.toMatchObject({ code: "PRECONDITION_FAILED" });
+    expect(db.createScheduledPost).not.toHaveBeenCalled();
+  });
+
+  it("rejects too-soon create, update, and retry reservation times before any database update", async () => {
+    const tooSoon = new Date(Date.now() + 30_000);
+    await expect(caller.scheduledPosts.create({ draftId: null, content: "時刻検証用の予約投稿", scheduledFor: tooSoon, timezone: "Asia/Tokyo" })).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    await expect(caller.scheduledPosts.update({ id: 31, scheduledFor: tooSoon })).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    await expect(caller.scheduledPosts.retry({ id: 31, scheduledFor: tooSoon })).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    expect(db.createScheduledPost).not.toHaveBeenCalled();
+    expect(db.updateScheduledPost).not.toHaveBeenCalled();
+    expect(db.retryScheduledPost).not.toHaveBeenCalled();
+  });
+
+  it("cancels a reservation only in the signed-in user's workspace", async () => {
+    vi.mocked(db.cancelScheduledPost).mockResolvedValue({ id: 31, userId: user.id, status: "cancelled" } as never);
+    await expect(caller.scheduledPosts.cancel({ id: 31 })).resolves.toMatchObject({ status: "cancelled" });
+    expect(db.cancelScheduledPost).toHaveBeenCalledWith(user.id, 31);
+  });
+
+  it("reschedules a failed reservation only for the signed-in user", async () => {
+    (settings as typeof settings & { xScheduledPostCronTaskUid?: string | null }).xScheduledPostCronTaskUid = "task-x";
+    const retryAt = new Date(Date.now() + 120_000);
+    vi.mocked(db.retryScheduledPost).mockResolvedValue({ id: 31, userId: user.id, status: "scheduled", scheduledFor: retryAt } as never);
+    await expect(caller.scheduledPosts.retry({ id: 31, scheduledFor: retryAt })).resolves.toMatchObject({ status: "scheduled" });
+    expect(db.retryScheduledPost).toHaveBeenCalledWith(user.id, 31, retryAt);
   });
 
   it("updates and deletes only the selected draft in the signed-in workspace", async () => {

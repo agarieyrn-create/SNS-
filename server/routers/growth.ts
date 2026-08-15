@@ -1,10 +1,14 @@
 import { TRPCError } from "@trpc/server";
+import { parse as parseCookie } from "cookie";
 import { z } from "zod";
+import { COOKIE_NAME } from "../../shared/const";
 import * as db from "../db";
 import { reviewPost } from "../growth-utils";
 import { invokeLLM, listLLMModels } from "../_core/llm";
 import { protectedProcedure, router } from "../_core/trpc";
 import { AI_PROVIDERS, generateWithProvider, generateWithProviderPriority, parseJsonResponse, providerDefaults } from "../ai-provider-gateway";
+import { createHeartbeatJob, updateHeartbeatJob } from "../_core/heartbeat";
+import { createXPost, testXConnection } from "../x-client";
 
 const ideaInput = z.object({
   title: z.string().trim().min(1).max(180),
@@ -42,6 +46,26 @@ const importedResultInput = resultInput.extend({
 });
 
 const aiProviderInput = z.enum(AI_PROVIDERS);
+const X_POST_WORKER_CRON = "0 * * * * *";
+const X_POST_WORKER_PATH = "/api/scheduled/x-post-worker";
+
+function getSessionToken(cookieHeader: string | undefined, authorization: string | undefined) {
+  const token = parseCookie(cookieHeader ?? "")[COOKIE_NAME] ?? authorization?.match(/^Bearer\s+(.+)$/i)?.[1];
+  if (!token) throw new TRPCError({ code: "UNAUTHORIZED", message: "予約投稿の設定には有効なログインセッションが必要です。" });
+  return token;
+}
+
+async function ensureXPostWorker(userId: number, cookieHeader: string | undefined, authorization: string | undefined) {
+  const settings = await db.getGrowthSettings(userId);
+  const sessionToken = getSessionToken(cookieHeader, authorization);
+  if (settings.xScheduledPostCronTaskUid) {
+    await updateHeartbeatJob(settings.xScheduledPostCronTaskUid, { cron: X_POST_WORKER_CRON, path: X_POST_WORKER_PATH, enable: true, description: "SNS Growth Copilot X予約投稿ワーカー（毎分）" }, sessionToken);
+    return settings.xScheduledPostCronTaskUid;
+  }
+  const created = await createHeartbeatJob({ name: `sns-x-post-worker-${userId}`, cron: X_POST_WORKER_CRON, path: X_POST_WORKER_PATH, payload: { type: "x-post-worker" }, description: "SNS Growth Copilot X予約投稿ワーカー（毎分）" }, sessionToken);
+  await db.updateXScheduledPostCronTaskUid(userId, created.taskUid);
+  return created.taskUid;
+}
 
 async function generateJsonWithConfiguredProvider(userId: number, input: { system: string; prompt: string; builtInModel: string; schema: any; action: "generate" | "rewrite" }) {
   const connections = await db.getAiProviderConnectionsForUse(userId);
@@ -91,6 +115,46 @@ export const growthRouter = router({
         await db.recordAiConnectionTest(connection.id, message.slice(0, 1000));
         throw new Error(message);
       }
+    }),
+  }),
+  xConnection: router({
+    status: protectedProcedure.query(({ ctx }) => db.getXAccountConnectionSummary(ctx.user.id)),
+    save: protectedProcedure.input(z.object({ apiKey: z.string().trim().min(5).max(500).optional(), apiSecret: z.string().trim().min(5).max(500).optional(), accessToken: z.string().trim().min(5).max(1000).optional(), accessTokenSecret: z.string().trim().min(5).max(1000).optional() })).mutation(({ ctx, input }) => db.saveXAccountConnection(ctx.user.id, input)),
+    test: protectedProcedure.mutation(async ({ ctx }) => {
+      const connection = await db.getXAccountConnection(ctx.user.id);
+      if (!connection) throw new TRPCError({ code: "NOT_FOUND", message: "先にXの認証情報を登録してください。" });
+      try {
+        const account = await testXConnection(connection);
+        await db.recordXAccountConnectionTest(ctx.user.id, null);
+        return { success: true, account, testedAt: new Date() };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "X接続テストに失敗しました。";
+        await db.recordXAccountConnectionTest(ctx.user.id, message.slice(0, 1000));
+        throw new TRPCError({ code: "BAD_GATEWAY", message });
+      }
+    }),
+    delete: protectedProcedure.mutation(({ ctx }) => db.deleteXAccountConnection(ctx.user.id)),
+  }),
+  scheduledPosts: router({
+    list: protectedProcedure.query(({ ctx }) => db.listScheduledPosts(ctx.user.id)),
+    runs: protectedProcedure.input(z.object({ scheduledPostId: z.number().int().positive().optional() }).optional()).query(({ ctx, input }) => db.listScheduledPostRuns(ctx.user.id, input?.scheduledPostId)),
+    create: protectedProcedure.input(z.object({ draftId: z.number().int().positive().nullable().optional(), content: z.string().trim().min(1).max(280), scheduledFor: z.coerce.date(), timezone: z.string().trim().min(1).max(64).default("Asia/Tokyo") })).mutation(async ({ ctx, input }) => {
+      if (input.scheduledFor.getTime() < Date.now() + 60_000) throw new TRPCError({ code: "BAD_REQUEST", message: "予約日時は現在から1分以上先を指定してください。" });
+      const connection = await db.getXAccountConnection(ctx.user.id);
+      if (!connection || !connection.lastTestedAt || connection.lastTestError) throw new TRPCError({ code: "PRECONDITION_FAILED", message: "先に設定画面でXの認証情報を登録し、接続テストを成功させてください。" });
+      await ensureXPostWorker(ctx.user.id, ctx.req.headers.cookie, ctx.req.headers.authorization);
+      return db.createScheduledPost(ctx.user.id, input);
+    }),
+    update: protectedProcedure.input(z.object({ id: z.number().int().positive(), content: z.string().trim().min(1).max(280).optional(), scheduledFor: z.coerce.date().optional(), timezone: z.string().trim().min(1).max(64).optional() })).mutation(async ({ ctx, input }) => {
+      if (input.scheduledFor && input.scheduledFor.getTime() < Date.now() + 60_000) throw new TRPCError({ code: "BAD_REQUEST", message: "予約日時は現在から1分以上先を指定してください。" });
+      const { id, ...updates } = input;
+      return db.updateScheduledPost(ctx.user.id, id, updates);
+    }),
+    cancel: protectedProcedure.input(z.object({ id: z.number().int().positive() })).mutation(({ ctx, input }) => db.cancelScheduledPost(ctx.user.id, input.id)),
+    retry: protectedProcedure.input(z.object({ id: z.number().int().positive(), scheduledFor: z.coerce.date() })).mutation(async ({ ctx, input }) => {
+      if (input.scheduledFor.getTime() < Date.now() + 60_000) throw new TRPCError({ code: "BAD_REQUEST", message: "再試行日時は現在から1分以上先を指定してください。" });
+      await ensureXPostWorker(ctx.user.id, ctx.req.headers.cookie, ctx.req.headers.authorization);
+      return db.retryScheduledPost(ctx.user.id, input.id, input.scheduledFor);
     }),
   }),
   ideas: router({

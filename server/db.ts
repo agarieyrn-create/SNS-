@@ -1,6 +1,6 @@
-import { and, desc, eq, gte, lt } from "drizzle-orm";
+import { and, desc, eq, gte, lt, lte } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/mysql2";
-import { AiProviderConnection, aiProviderConnections, aiUsageRecords, GrowthSettings, growthSettings, ideas, InsertUser, postDrafts, postResults, users, weeklyReportRuns, weeklyReports } from "../drizzle/schema";
+import { AiProviderConnection, aiProviderConnections, aiUsageRecords, GrowthSettings, growthSettings, ideas, InsertUser, postDrafts, postResults, scheduledPostRuns, scheduledPosts, users, weeklyReportRuns, weeklyReports, xAccountConnections } from "../drizzle/schema";
 import { calculateEngagementRate, makeTrend, reviewPost } from "./growth-utils";
 import { ENV } from "./_core/env";
 import { AiProvider, AI_PROVIDERS, encryptApiKey } from "./ai-provider-gateway";
@@ -162,6 +162,170 @@ export async function deleteAiProviderConnection(userId: number, provider: AiPro
   if (!db) throw new Error("Database is not available");
   await db.delete(aiProviderConnections).where(and(eq(aiProviderConnections.userId, userId), eq(aiProviderConnections.provider, provider)));
   return listAiProviderConnections(userId);
+}
+
+export type XAccountConnectionSummary = { registered: boolean; lastTestedAt: Date | null; lastTestError: string | null };
+
+export async function getXAccountConnection(userId: number) {
+  const db = await getDb();
+  if (!db) throw new Error("Database is not available");
+  const rows = await db.select().from(xAccountConnections).where(eq(xAccountConnections.userId, userId)).limit(1);
+  return rows[0];
+}
+
+export async function getXAccountConnectionSummary(userId: number): Promise<XAccountConnectionSummary> {
+  const connection = await getXAccountConnection(userId);
+  return { registered: Boolean(connection), lastTestedAt: connection?.lastTestedAt ?? null, lastTestError: connection?.lastTestError ?? null };
+}
+
+export async function saveXAccountConnection(userId: number, input: { apiKey?: string; apiSecret?: string; accessToken?: string; accessTokenSecret?: string }) {
+  const db = await getDb();
+  if (!db) throw new Error("Database is not available");
+  const existing = await getXAccountConnection(userId);
+  const apiKeyValue = input.apiKey?.trim(); const apiSecretValue = input.apiSecret?.trim(); const accessTokenValue = input.accessToken?.trim(); const accessTokenSecretValue = input.accessTokenSecret?.trim();
+  if (!existing && (!apiKeyValue || !apiSecretValue || !accessTokenValue || !accessTokenSecretValue)) throw new Error("初回登録時はXの4つの認証情報をすべて入力してください。");
+  const apiKey = apiKeyValue ? encryptApiKey(apiKeyValue) : null;
+  const apiSecret = apiSecretValue ? encryptApiKey(apiSecretValue) : null;
+  const accessToken = accessTokenValue ? encryptApiKey(accessTokenValue) : null;
+  const accessTokenSecret = accessTokenSecretValue ? encryptApiKey(accessTokenSecretValue) : null;
+  const encryptedFields = {
+    ...(apiKey ? { encryptedApiKey: apiKey.encryptedApiKey, apiKeyIv: apiKey.encryptionIv, apiKeyTag: apiKey.encryptionTag } : {}),
+    ...(apiSecret ? { encryptedApiSecret: apiSecret.encryptedApiKey, apiSecretIv: apiSecret.encryptionIv, apiSecretTag: apiSecret.encryptionTag } : {}),
+    ...(accessToken ? { encryptedAccessToken: accessToken.encryptedApiKey, accessTokenIv: accessToken.encryptionIv, accessTokenTag: accessToken.encryptionTag } : {}),
+    ...(accessTokenSecret ? { encryptedAccessTokenSecret: accessTokenSecret.encryptedApiKey, accessTokenSecretIv: accessTokenSecret.encryptionIv, accessTokenSecretTag: accessTokenSecret.encryptionTag } : {}),
+  };
+  if (!existing) await db.insert(xAccountConnections).values({ userId, ...encryptedFields } as typeof xAccountConnections.$inferInsert);
+  else await db.update(xAccountConnections).set(encryptedFields).where(eq(xAccountConnections.userId, userId));
+  return getXAccountConnectionSummary(userId);
+}
+
+export async function recordXAccountConnectionTest(userId: number, error: string | null) {
+  const db = await getDb();
+  if (!db) throw new Error("Database is not available");
+  await db.update(xAccountConnections).set({ lastTestedAt: new Date(), lastTestError: error }).where(eq(xAccountConnections.userId, userId));
+}
+
+export async function deleteXAccountConnection(userId: number) {
+  const db = await getDb();
+  if (!db) throw new Error("Database is not available");
+  await db.delete(xAccountConnections).where(eq(xAccountConnections.userId, userId));
+  return { success: true } as const;
+}
+
+export async function createScheduledPost(userId: number, input: { draftId?: number | null; content: string; scheduledFor: Date; timezone: string }) {
+  const db = await getDb();
+  if (!db) throw new Error("Database is not available");
+  if (input.draftId) {
+    const draft = await db.select({ id: postDrafts.id }).from(postDrafts).where(and(eq(postDrafts.id, input.draftId), eq(postDrafts.userId, userId))).limit(1);
+    if (!draft[0]) throw new Error("予約する投稿案が見つかりません。");
+  }
+  const [created] = await db.insert(scheduledPosts).values({ userId, ...input }).$returningId();
+  return getScheduledPost(userId, created.id);
+}
+
+export async function getScheduledPost(userId: number, id: number) {
+  const db = await getDb();
+  if (!db) throw new Error("Database is not available");
+  const rows = await db.select().from(scheduledPosts).where(and(eq(scheduledPosts.id, id), eq(scheduledPosts.userId, userId))).limit(1);
+  if (!rows[0]) throw new Error("予約投稿が見つかりません。");
+  return rows[0];
+}
+
+export async function listScheduledPosts(userId: number) {
+  const db = await getDb();
+  if (!db) throw new Error("Database is not available");
+  return db.select().from(scheduledPosts).where(eq(scheduledPosts.userId, userId)).orderBy(desc(scheduledPosts.scheduledFor));
+}
+
+export async function updateScheduledPost(userId: number, id: number, input: { content?: string; scheduledFor?: Date; timezone?: string }) {
+  const current = await getScheduledPost(userId, id);
+  if (current.status !== "scheduled") throw new Error("送信開始後または取消済みの予約は編集できません。");
+  const db = await getDb();
+  if (!db) throw new Error("Database is not available");
+  await db.update(scheduledPosts).set(input).where(and(eq(scheduledPosts.id, id), eq(scheduledPosts.userId, userId), eq(scheduledPosts.status, "scheduled")));
+  return getScheduledPost(userId, id);
+}
+
+export async function updateScheduledPostCronTaskUid(userId: number, id: number, taskUid: string | null) {
+  const db = await getDb();
+  if (!db) throw new Error("Database is not available");
+  await db.update(scheduledPosts).set({ scheduleCronTaskUid: taskUid }).where(and(eq(scheduledPosts.id, id), eq(scheduledPosts.userId, userId)));
+  return getScheduledPost(userId, id);
+}
+
+export async function cancelScheduledPost(userId: number, id: number) {
+  const current = await getScheduledPost(userId, id);
+  if (current.status === "published") throw new Error("送信済みの投稿は取消できません。");
+  const db = await getDb();
+  if (!db) throw new Error("Database is not available");
+  await db.update(scheduledPosts).set({ status: "cancelled", scheduleCronTaskUid: null }).where(and(eq(scheduledPosts.id, id), eq(scheduledPosts.userId, userId), eq(scheduledPosts.status, "scheduled")));
+  return getScheduledPost(userId, id);
+}
+
+export async function retryScheduledPost(userId: number, id: number, scheduledFor: Date) {
+  const current = await getScheduledPost(userId, id);
+  if (current.status !== "failed") throw new Error("失敗した予約投稿だけを再試行できます。");
+  const db = await getDb();
+  if (!db) throw new Error("Database is not available");
+  await db.update(scheduledPosts).set({ status: "scheduled", scheduledFor, scheduleCronTaskUid: null, nextAttemptTrigger: "retry", lastError: null }).where(and(eq(scheduledPosts.id, id), eq(scheduledPosts.userId, userId), eq(scheduledPosts.status, "failed")));
+  return getScheduledPost(userId, id);
+}
+
+export async function getScheduledPostByCronTaskUid(taskUid: string) {
+  const db = await getDb();
+  if (!db) throw new Error("Database is not available");
+  const rows = await db.select().from(scheduledPosts).where(eq(scheduledPosts.scheduleCronTaskUid, taskUid)).limit(1);
+  return rows[0];
+}
+
+export async function listDueScheduledPosts(userId: number, now = new Date()) {
+  const db = await getDb();
+  if (!db) throw new Error("Database is not available");
+  return db.select().from(scheduledPosts).where(and(eq(scheduledPosts.userId, userId), eq(scheduledPosts.status, "scheduled"), lte(scheduledPosts.scheduledFor, now))).orderBy(scheduledPosts.scheduledFor).limit(10);
+}
+
+export async function createScheduledPostRun(userId: number, input: { scheduledPostId: number; taskUid?: string | null; trigger: "scheduled" | "retry" }) {
+  const db = await getDb();
+  if (!db) throw new Error("Database is not available");
+  const startedAt = new Date();
+  const [created] = await db.insert(scheduledPostRuns).values({ userId, scheduledPostId: input.scheduledPostId, taskUid: input.taskUid ?? null, trigger: input.trigger, status: "running", startedAt }).$returningId();
+  return { id: created.id, startedAt };
+}
+
+export async function finishScheduledPostRun(id: number, input: { status: "succeeded" | "failed" | "skipped"; xPostId?: string | null; error?: string | null }) {
+  const db = await getDb();
+  if (!db) throw new Error("Database is not available");
+  await db.update(scheduledPostRuns).set({ status: input.status, xPostId: input.xPostId ?? null, error: input.error ?? null, finishedAt: new Date() }).where(eq(scheduledPostRuns.id, id));
+}
+
+export async function listScheduledPostRuns(userId: number, scheduledPostId?: number) {
+  const db = await getDb();
+  if (!db) throw new Error("Database is not available");
+  const scope = scheduledPostId ? and(eq(scheduledPostRuns.userId, userId), eq(scheduledPostRuns.scheduledPostId, scheduledPostId)) : eq(scheduledPostRuns.userId, userId);
+  return db.select().from(scheduledPostRuns).where(scope).orderBy(desc(scheduledPostRuns.startedAt)).limit(30);
+}
+
+export async function startScheduledPostPublishing(id: number) {
+  const db = await getDb();
+  if (!db) throw new Error("Database is not available");
+  const rows = await db.select().from(scheduledPosts).where(eq(scheduledPosts.id, id)).limit(1);
+  const post = rows[0];
+  if (!post || post.status !== "scheduled") return { acquired: false as const, post };
+  const result = await db.update(scheduledPosts).set({ status: "publishing", nextAttemptTrigger: "scheduled", attemptCount: post.attemptCount + 1, lastAttemptAt: new Date() }).where(and(eq(scheduledPosts.id, id), eq(scheduledPosts.status, "scheduled")));
+  const packet = Array.isArray(result) ? result[0] as { affectedRows?: number } : result as unknown as { affectedRows?: number };
+  return { acquired: (packet.affectedRows ?? 0) === 1, post };
+}
+
+export async function markScheduledPostPublished(id: number, xPostId: string) {
+  const db = await getDb();
+  if (!db) throw new Error("Database is not available");
+  await db.update(scheduledPosts).set({ status: "published", xPostId, postedAt: new Date(), lastAttemptAt: new Date(), lastError: null, scheduleCronTaskUid: null }).where(and(eq(scheduledPosts.id, id), eq(scheduledPosts.status, "publishing")));
+}
+
+export async function markScheduledPostFailed(id: number, error: string) {
+  const db = await getDb();
+  if (!db) throw new Error("Database is not available");
+  await db.update(scheduledPosts).set({ status: "failed", lastAttemptAt: new Date(), lastError: error }).where(and(eq(scheduledPosts.id, id), eq(scheduledPosts.status, "publishing")));
 }
 
 export async function reserveAiUsage(userId: number, connection: AiProviderConnection, action: "generate" | "rewrite" | "connection_test") {
@@ -449,9 +613,24 @@ export async function updateWeeklyReportSchedule(userId: number, updates: Partia
   return getGrowthSettings(userId);
 }
 
+export async function updateXScheduledPostCronTaskUid(userId: number, taskUid: string | null) {
+  const db = await getDb();
+  if (!db) throw new Error("Database is not available");
+  await getGrowthSettings(userId);
+  await db.update(growthSettings).set({ xScheduledPostCronTaskUid: taskUid }).where(eq(growthSettings.userId, userId));
+  return getGrowthSettings(userId);
+}
+
 export async function getGrowthSettingsByWeeklyCronTaskUid(taskUid: string) {
   const db = await getDb();
   if (!db) throw new Error("Database is not available");
   const rows = await db.select().from(growthSettings).where(eq(growthSettings.weeklyReportCronTaskUid, taskUid)).limit(1);
+  return rows[0];
+}
+
+export async function getGrowthSettingsByXScheduledPostCronTaskUid(taskUid: string) {
+  const db = await getDb();
+  if (!db) throw new Error("Database is not available");
+  const rows = await db.select().from(growthSettings).where(eq(growthSettings.xScheduledPostCronTaskUid, taskUid)).limit(1);
   return rows[0];
 }
