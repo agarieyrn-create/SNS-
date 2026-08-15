@@ -1,0 +1,1 @@
+ALTER TABLE `scheduledPosts` ADD `nextAttemptTrigger` enum('scheduled','retry') DEFAULT 'scheduled' NOT NULL;

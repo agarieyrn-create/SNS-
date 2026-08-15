@@ -1,0 +1,83 @@
+import { useAuth } from "@/_core/hooks/useAuth";
+import { AiProviderLimitAlert } from "@/components/AiProviderLimitAlert";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent } from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { trpc } from "@/lib/trpc";
+import { ArrowDown, ArrowUp, Check, ChevronDown, ChevronUp, Download, KeyRound, Loader2, PlugZap, ShieldCheck, Trash2 } from "lucide-react";
+import React, { useEffect, useMemo, useState } from "react";
+import { toast } from "sonner";
+
+type Provider = "openai" | "anthropic" | "gemini" | "openrouter";
+const providerInfo: Record<Provider, { name: string; modelHint: string; description: string }> = {
+  openai: { name: "OpenAI", modelHint: "例：gpt-5-mini", description: "OpenAI Platformで発行したAPIキーを使います。" },
+  anthropic: { name: "Claude", modelHint: "例：claude-sonnet-4-6", description: "Anthropic Consoleで発行したAPIキーを使います。" },
+  gemini: { name: "Gemini", modelHint: "例：gemini-3.6-flash", description: "Google AI Studioで発行したGemini APIキーを使います。" },
+  openrouter: { name: "OpenRouter", modelHint: "例：openai/gpt-5-mini", description: "OpenRouterで利用可能なモデルIDを指定できます。" },
+};
+
+function csvCell(value: unknown) { return `"${String(value ?? "").replaceAll('"', '""')}"`; }
+function formatTestedAt(value: Date | string | null) { return value ? new Intl.DateTimeFormat("ja-JP", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }).format(new Date(value)) : "未テスト"; }
+
+export function AiProviderSettings() {
+  const { isAuthenticated } = useAuth();
+  const utils = trpc.useUtils();
+  const connections = trpc.growth.aiConnections.list.useQuery(undefined, { enabled: isAuthenticated });
+  const usage = trpc.growth.aiConnections.usage.useQuery(undefined, { enabled: isAuthenticated });
+  const [apiKeys, setApiKeys] = useState<Record<string, string>>({});
+  const [models, setModels] = useState<Record<string, string>>({});
+  const [enabled, setEnabled] = useState<Record<string, boolean>>({});
+  const [limits, setLimits] = useState<Record<string, { requests: number; budget: number; reservation: number }>>({});
+  const [expanded, setExpanded] = useState<Record<string, boolean>>({});
+  const [testAfterSave, setTestAfterSave] = useState<Provider | null>(null);
+
+  useEffect(() => {
+    if (!connections.data) return;
+    setModels(Object.fromEntries(connections.data.providers.map(item => [item.provider, item.model || connections.data.defaults.find(defaults => defaults.provider === item.provider)?.defaultModel || ""])));
+    setEnabled(Object.fromEntries(connections.data.providers.map(item => [item.provider, item.enabled])));
+    setLimits(Object.fromEntries(connections.data.providers.map(item => [item.provider, { requests: item.monthlyRequestLimit, budget: item.monthlyBudgetMilliUsd, reservation: item.perRequestReservationMilliUsd }])));
+  }, [connections.data]);
+
+  const refresh = () => { utils.growth.aiConnections.list.invalidate(); utils.growth.aiConnections.usage.invalidate(); };
+  const testConnection = trpc.growth.aiConnections.test.useMutation({ onSuccess: (_, variables) => { refresh(); toast.success(`${providerInfo[variables.provider].name}への接続を確認しました。`); }, onError: error => { refresh(); toast.error(error.message); } });
+  const save = trpc.growth.aiConnections.save.useMutation({ onSuccess: (_, variables) => { const runTest = testAfterSave === variables.provider; setTestAfterSave(null); refresh(); setApiKeys(current => ({ ...current, [variables.provider]: "" })); toast.success(`${providerInfo[variables.provider].name}の接続設定を保存しました。`); if (runTest) window.setTimeout(() => testConnection.mutate({ provider: variables.provider }), 150); }, onError: error => { setTestAfterSave(null); toast.error(error.message); } });
+  const reorder = trpc.growth.aiConnections.reorder.useMutation({ onSuccess: () => { refresh(); toast.success("AIの優先順位を更新しました。"); }, onError: error => toast.error(error.message) });
+  const remove = trpc.growth.aiConnections.delete.useMutation({ onSuccess: () => { refresh(); toast.success("AI接続を削除しました。"); }, onError: error => toast.error(error.message) });
+
+  const registered = useMemo(() => (connections.data?.providers ?? []).filter(item => item.registered).sort((left, right) => left.priority - right.priority), [connections.data]);
+  const move = (provider: Provider, direction: -1 | 1) => {
+    const index = registered.findIndex(item => item.provider === provider); const target = index + direction;
+    if (index < 0 || target < 0 || target >= registered.length) return;
+    const reordered = [...registered]; [reordered[index], reordered[target]] = [reordered[target], reordered[index]];
+    reorder.mutate({ priorities: reordered.map((item, priority) => ({ provider: item.provider, priority: priority + 1, enabled: enabled[item.provider] ?? item.enabled })) });
+  };
+  const exportUsage = () => {
+    const header = ["日時", "プロバイダー", "アクション", "状態", "入力トークン", "出力トークン", "予約額USD", "実費USD", "エラー"];
+    const rows = (usage.data ?? []).map(row => [new Date(row.createdAt).toISOString(), providerInfo[row.provider as Provider].name, row.action, row.status, row.inputTokens ?? "", row.outputTokens ?? "", ((row.reservedCostMilliUsd ?? 0) / 1000).toFixed(4), ((row.chargedCostMilliUsd ?? row.reservedCostMilliUsd ?? 0) / 1000).toFixed(4), row.error ?? ""]);
+    const blob = new Blob([[header, ...rows].map(row => row.map(csvCell).join(",")).join("\n")], { type: "text/csv;charset=utf-8" });
+    const link = document.createElement("a"); link.href = URL.createObjectURL(blob); link.download = `sns-growth-copilot-ai-usage-${new Date().toISOString().slice(0, 7)}.csv`; link.click(); URL.revokeObjectURL(link.href);
+  };
+  const saveConnection = (input: { provider: Provider; apiKey?: string; model: string; enabled: boolean; priority: number; monthlyRequestLimit: number; monthlyBudgetMilliUsd: number; perRequestReservationMilliUsd: number }, runTest = false) => {
+    if (runTest) setTestAfterSave(input.provider);
+    save.mutate(input);
+  };
+
+  if (connections.isLoading && isAuthenticated) return <Card className="soft-card mt-6 rounded-2xl"><CardContent className="flex items-center gap-3 p-6 text-sm text-muted-foreground"><Loader2 className="h-5 w-5 animate-spin text-primary" />AI接続の設定を読み込んでいます。</CardContent></Card>;
+
+  return <Card className="soft-card mt-6 rounded-2xl"><CardContent className="p-5 sm:p-6"><div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between"><div><p className="eyebrow">AI connections</p><h2 className="mt-1 text-lg font-bold">AI接続と優先順位</h2><p className="mt-2 max-w-2xl text-xs leading-relaxed text-muted-foreground">APIキーは画面に再表示せず、サーバー側で暗号化して保存します。有効な接続を上から順に試し、失敗時は次の接続へ切り替えます。</p></div><Badge className="w-fit rounded-full border-0 bg-[#e2edf6] px-3 py-1 text-[10px] text-[#49657e]">投稿案・AI改善に適用</Badge></div>
+    <div className="mt-5 rounded-xl border border-[#ecd8ae] bg-[#fcf8ed] p-3 text-xs leading-relaxed text-[#745b2a]"><strong>ChatGPTサブスクはAPIキーではありません。</strong> OpenAIを使う場合はOpenAI PlatformのAPIキーが必要です。Claude、Gemini、OpenRouterもそれぞれのAPIキーを登録してください。</div>
+    <div className="mt-4 flex flex-col gap-3 rounded-xl border border-border/70 bg-secondary/35 p-3 sm:flex-row sm:items-center sm:justify-between"><div><p className="text-xs font-semibold">今月のAI利用履歴</p><p className="mt-1 text-[11px] text-muted-foreground">生成・改善・接続テストの回数、トークン、費用をCSVで確認できます。</p></div><Button type="button" size="sm" variant="outline" onClick={exportUsage} disabled={!usage.data?.length} className="shrink-0 rounded-lg bg-card"><Download className="mr-1.5 h-3.5 w-3.5" />今月の履歴をCSV</Button></div>
+    <div className="mt-5 grid gap-4 xl:grid-cols-2">{(connections.data?.providers ?? []).map(item => {
+      const provider = item.provider as Provider; const info = providerInfo[provider]; const priority = registered.findIndex(registeredItem => registeredItem.provider === provider) + 1; const limit = limits[provider] ?? { requests: item.monthlyRequestLimit, budget: item.monthlyBudgetMilliUsd, reservation: item.perRequestReservationMilliUsd }; const isExpanded = expanded[provider] ?? (item.registered && priority === 1); const connectionInput = { provider, apiKey: apiKeys[provider]?.trim() || undefined, model: models[provider] || info.modelHint.replace("例：", ""), enabled: enabled[provider] ?? Boolean(apiKeys[provider]?.trim()), priority: item.registered ? item.priority : registered.length + 1, monthlyRequestLimit: limit.requests, monthlyBudgetMilliUsd: limit.budget, perRequestReservationMilliUsd: limit.reservation };
+      return <div key={provider} className="rounded-2xl border border-border/70 bg-card/70 p-4"><div className="flex items-start justify-between gap-3"><div><div className="flex flex-wrap items-center gap-2"><h3 className="text-sm font-bold">{info.name}</h3>{item.registered ? <Badge className="rounded-full border-0 bg-[#e6f0e3] px-2 py-0.5 text-[10px] text-[#558151]">登録済み</Badge> : <Badge variant="outline" className="rounded-full bg-card px-2 py-0.5 text-[10px]">未登録</Badge>}{item.registered && priority > 0 ? <span className="mono text-[10px] text-muted-foreground">優先 {priority}</span> : null}</div><p className="mt-1 text-[11px] leading-relaxed text-muted-foreground">{info.description}</p></div>{item.registered ? <div className="flex items-center gap-1"><Button type="button" size="icon" variant="ghost" disabled={priority <= 1 || reorder.isPending} onClick={() => move(provider, -1)} aria-label={`${info.name}の優先順位を上げる`}><ArrowUp className="h-4 w-4" /></Button><Button type="button" size="icon" variant="ghost" disabled={priority < 1 || priority >= registered.length || reorder.isPending} onClick={() => move(provider, 1)} aria-label={`${info.name}の優先順位を下げる`}><ArrowDown className="h-4 w-4" /></Button></div> : null}</div>
+        {item.registered ? <div className="mt-3 flex flex-col gap-2 rounded-xl border border-[#cbd9e6] bg-[#f3f8fc] p-3 sm:flex-row sm:items-center sm:justify-between"><div className="min-w-0"><p className="text-[11px] font-semibold text-[#304f6b]">APIキーの接続診断：{formatTestedAt(item.lastTestedAt)}</p>{item.lastTestError ? <p className="mt-1 truncate text-[10px] text-destructive" title={item.lastTestError}>前回失敗：{item.lastTestError}</p> : item.lastTestedAt ? <p className="mt-1 text-[10px] text-[#558151]">前回の接続テストは成功しています。</p> : <p className="mt-1 text-[10px] text-muted-foreground">未テストです。キーが正しいか確認してください。</p>}</div><Button type="button" size="sm" variant="outline" onClick={() => testConnection.mutate({ provider })} disabled={testConnection.isPending} className="shrink-0 rounded-lg bg-card">{testConnection.isPending && testConnection.variables?.provider === provider ? <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" /> : <PlugZap className="mr-1.5 h-3.5 w-3.5" />}接続をテスト</Button></div> : null}
+        {item.registered ? <AiProviderLimitAlert snapshot={item} /> : null}
+        <button type="button" onClick={() => setExpanded(current => ({ ...current, [provider]: !isExpanded }))} className="mt-3 flex w-full items-center justify-between rounded-lg px-1 py-2 text-left text-xs font-semibold text-primary hover:bg-secondary/55"><span>{isExpanded ? "設定を閉じる" : item.registered ? "モデル・上限・キーを編集" : "APIキーと上限を設定"}</span>{isExpanded ? <ChevronUp className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}</button>
+        {isExpanded ? <><div className="mt-2 grid gap-3"><div><Label className="text-[11px]">モデル</Label><Input value={models[provider] ?? ""} onChange={event => setModels(current => ({ ...current, [provider]: event.target.value }))} placeholder={info.modelHint} className="mt-1" /></div><div><Label className="text-[11px]">APIキー {item.registered ? "（変更する場合のみ入力）" : "*"}</Label><div className="relative mt-1"><KeyRound className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" /><Input type="password" autoComplete="off" value={apiKeys[provider] ?? ""} onChange={event => setApiKeys(current => ({ ...current, [provider]: event.target.value }))} placeholder={item.registered ? "暗号化して保存済み" : "APIキーを入力"} className="pl-9" /></div></div><div className="grid grid-cols-3 gap-2 rounded-xl bg-secondary/45 p-2"><div><Label className="text-[9px]">月間回数</Label><Input type="number" min="1" value={limit.requests} onChange={event => setLimits(current => ({ ...current, [provider]: { ...limit, requests: Math.max(1, Number(event.target.value) || 1) } }))} className="mt-1 h-8 px-2 text-xs" /></div><div><Label className="text-[9px]">月額上限 $</Label><Input type="number" min="0.01" step="0.01" value={(limit.budget / 1000).toFixed(2)} onChange={event => setLimits(current => ({ ...current, [provider]: { ...limit, budget: Math.max(1, Math.round((Number(event.target.value) || 0.01) * 1000)) } }))} className="mt-1 h-8 px-2 text-xs" /></div><div><Label className="text-[9px]">1回最大 $</Label><Input type="number" min="0.001" step="0.001" value={(limit.reservation / 1000).toFixed(3)} onChange={event => setLimits(current => ({ ...current, [provider]: { ...limit, reservation: Math.max(1, Math.round((Number(event.target.value) || 0.001) * 1000)) } }))} className="mt-1 h-8 px-2 text-xs" /></div></div><label className="flex cursor-pointer items-center gap-2 text-xs font-medium"><input type="checkbox" checked={enabled[provider] ?? false} disabled={!item.registered && !(apiKeys[provider]?.trim())} onChange={event => setEnabled(current => ({ ...current, [provider]: event.target.checked }))} />この接続を有効にする</label></div><div className="mt-4 flex flex-wrap items-center justify-between gap-3 border-t border-border/60 pt-3"><span className="text-[10px] text-muted-foreground">{item.registered ? `今月 ${item.monthlyRequestCount}/${item.monthlyRequestLimit}回 · 残り ${Math.max(0, item.monthlyRequestLimit - item.monthlyRequestCount)}回 · $${(item.monthlyCostMilliUsd / 1000).toFixed(2)}/$${(item.monthlyBudgetMilliUsd / 1000).toFixed(2)}（残り $${(Math.max(0, item.monthlyBudgetMilliUsd - item.monthlyCostMilliUsd) / 1000).toFixed(2)}）` : "保存すると優先順位に追加されます"}</span><div className="flex flex-wrap gap-2">{item.registered ? <Button type="button" size="sm" variant="ghost" className="text-destructive hover:bg-destructive/10 hover:text-destructive" onClick={() => { if (window.confirm(`${info.name}の接続を削除しますか？`)) remove.mutate({ provider }); }} disabled={remove.isPending}><Trash2 className="mr-1.5 h-3.5 w-3.5" />削除</Button> : null}<Button type="button" size="sm" variant="outline" onClick={() => saveConnection(connectionInput, true)} disabled={save.isPending || !connectionInput.model.trim() || (!item.registered && !connectionInput.apiKey)} className="rounded-lg border-[#cbd9e6] bg-[#f3f8fc] text-[#49657e]">{save.isPending && testAfterSave === provider ? <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" /> : <PlugZap className="mr-1.5 h-3.5 w-3.5" />}{item.registered ? "保存して再テスト" : "保存して接続テスト"}</Button><Button type="button" size="sm" onClick={() => saveConnection(connectionInput)} disabled={save.isPending || !connectionInput.model.trim() || (!item.registered && !connectionInput.apiKey)}>{save.isPending && testAfterSave !== provider ? <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" /> : <Check className="mr-1.5 h-3.5 w-3.5" />}{item.registered ? "更新" : "登録"}</Button></div></div></> : null}
+      </div>;
+    })}</div>
+    <div className="mt-5 flex items-start gap-2 rounded-xl bg-secondary/55 p-3 text-[11px] leading-relaxed text-muted-foreground"><ShieldCheck className="mt-0.5 h-4 w-4 shrink-0 text-primary" />接続テストも月間上限に含まれます。登録したキーは画面に表示せず、各プロバイダーへの呼び出し時だけサーバー内で復号します。全接続を無効にした場合は、従来どおりアプリ内蔵AIを使います。</div>
+  </CardContent></Card>;
+}
